@@ -1,7 +1,7 @@
 #!/system/bin/sh
 set -u
 
-MANAGER_VERSION=2026090616
+MANAGER_VERSION=2026090701
 
 # RouterOS CHR (ARM64) runs under QEMU/KVM, not crosvm: CHR boots through UEFI
 # (BOOTAA64.EFI in its ESP) and crosvm has no pflash/MMIO firmware path.  The
@@ -31,6 +31,12 @@ RA6="$VM_DIR/ra6"
 KVM_PROBE="$VM_DIR/kvm-probe"
 DHCP_RELAY="$VM_DIR/dhcp-relay"
 IPV6_PREFIX_FILE="$VM_DIR/ipv6-prefix"
+# Which of the two downstream IPv6 designs the host is currently wired for.
+# Tracked separately from the prefix because the two modes hang fe80::1, the
+# /64 route and the policy rules off different interfaces (ros-br vs ros-wan):
+# switching between them while the carrier prefix happens to be unchanged has
+# to still tear the old wiring down.
+IPV6_MODE_FILE="$VM_DIR/ipv6-mode"
 TAKEOVER_FLAG="$VM_DIR/takeover.enabled"
 # QMP replaces the crosvm control socket: shutdown, USB hotplug and vCPU
 # thread discovery all go through it.
@@ -113,7 +119,7 @@ load_config() {
     : "${VM_MEMORY_MIB:=384}"
     : "${AUTO_TAKEOVER:=0}"
     : "${NETWORK_MONITOR:=1}"
-    : "${IPV6_PASSTHROUGH:=1}"
+    : "${IPV6_PASSTHROUGH:=0}"
     : "${QEMU_PATH:=auto}"
     : "${VM_VHOST:=auto}"
     : "${QEMU_EXTRA_ARGS:=}"
@@ -142,11 +148,12 @@ load_config() {
     # Guest-side NIC names.  QEMU enumerates the netdevs in command-line
     # order, so the WAN device is ether1 and the LAN device (the one that
     # carries LAN_GUEST_IP) is ether2.
-    : "${ROS_WAN_IFACE:=ether1}"
-    : "${ROS_LAN_IFACE:=ether2}"
+    : "${ROS_WAN_IFACE:=wan}"
+    : "${ROS_LAN_IFACE:=lan}"
     # Gateway mode moves DHCP off Android and onto RouterOS; without a server
     # in the guest, clients would simply get no lease.  Ignored when
     # STANDALONE=1 (Android keeps serving DHCP there).
+    : "${ROS_ULA_PREFIX:=}"
     : "${ROS_DHCP_ENABLED:=1}"
     : "${ROS_DHCP_POOL_START:=100}"
     : "${ROS_DHCP_POOL_END:=200}"
@@ -185,6 +192,14 @@ load_config() {
         0|1) ;;
         *) die "IPV6_PASSTHROUGH must be 0 or 1" ;;
     esac
+    # Empty means "derive it" (see ros_ula_prefix).  A hand-set value has to be
+    # three hex groups starting fd/fc -- RouterOS would reject anything else
+    # mid-script, and sync only checks the IPv4 address afterwards, so a bad
+    # value here would be reported as success.
+    if [ -n "$ROS_ULA_PREFIX" ]; then
+        printf '%s\n' "$ROS_ULA_PREFIX" | grep -qiE '^f[cd][0-9a-f]{2}(:[0-9a-f]{1,4}){2}$' || \
+            die "ROS_ULA_PREFIX 必须形如 fdXX:XXXX:XXXX（三组十六进制，fc/fd 开头）: $ROS_ULA_PREFIX"
+    fi
     case "$TETHER_MODE" in
         auto|bridge|routed|proxyarp|directbr0) ;;
         *) die "TETHER_MODE must be auto, bridge, routed, proxyarp, or directbr0" ;;
@@ -1234,6 +1249,30 @@ sync_tether_network() {
     esac
 }
 
+# The LAN prefix RouterOS advertises in managed mode.  It has to be a ULA, not
+# a slice of the carrier prefix: mobile carriers hand out a single /64 with no
+# prefix delegation, so there is nothing to subnet.  Deriving it from the guest
+# LAN MAC rather than storing a random one keeps it stable across syncs and
+# reinstalls while staying distinct per device -- which matters because
+# sync_network_config can only reach RouterOS through an offline maintenance
+# boot, so a LAN prefix that changed with the carrier's would mean rebooting
+# the VM every time the cellular network renumbers.
+ros_ula_prefix() {
+    if [ -n "$ROS_ULA_PREFIX" ]; then
+        printf '%s' "$ROS_ULA_PREFIX"
+        return 0
+    fi
+    ula_hex="$(printf '%s' "$LAN_MAC" | sha256sum 2>/dev/null | cut -c1-10)"
+    case "$ula_hex" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+        *) ula_hex=00c0ffee01 ;;
+    esac
+    printf 'fd%s:%s:%s' \
+        "$(printf '%s' "$ula_hex" | cut -c1-2)" \
+        "$(printf '%s' "$ula_hex" | cut -c3-6)" \
+        "$(printf '%s' "$ula_hex" | cut -c7-10)"
+}
+
 cellular_ipv6_prefix() {
     ip -6 -o addr show dev "$CELLULAR_IFACE" scope global 2>/dev/null | awk '
         NR == 1 {
@@ -1281,7 +1320,7 @@ stop_ipv6_downstream() {
     ip -6 addr del fe80::1/64 dev "$WAN_TAP" 2>/dev/null || true
     delete_ip6_jump_and_chain FORWARD "$IPV6_FORWARD_CHAIN"
     delete_ip6_jump_and_chain OUTPUT ROS6_OUT
-    rm -f "$IPV6_PREFIX_FILE"
+    rm -f "$IPV6_PREFIX_FILE" "$IPV6_MODE_FILE"
 }
 
 ensure_ra6_port() {
@@ -1313,13 +1352,15 @@ sync_ipv6_passthrough() {
     fi
 
     current_prefix="$(cat "$IPV6_PREFIX_FILE" 2>/dev/null)"
-    if [ "$current_prefix" != "$prefix" ]; then
+    current_mode="$(cat "$IPV6_MODE_FILE" 2>/dev/null)"
+    if [ "$current_prefix" != "$prefix" ] || [ "$current_mode" != passthrough ]; then
         stop_ipv6_downstream
         ip -6 addr replace fe80::1/64 dev "$LAN_BRIDGE"
         ip -6 route replace "$prefix/64" dev "$LAN_BRIDGE" metric 64 table main
         ip -6 rule add priority "$IPV6_OUT_RULE_PRIO" iif "$LAN_BRIDGE" lookup "$CELLULAR_ROUTE_TABLE"
         ip -6 rule add priority "$IPV6_IN_RULE_PRIO" iif "$CELLULAR_IFACE" to "$prefix/64" lookup main
         echo "$prefix" > "$IPV6_PREFIX_FILE"
+        echo passthrough > "$IPV6_MODE_FILE"
     fi
 
     active_ra="$VM_DIR/ra6-active"
@@ -1403,7 +1444,8 @@ sync_ipv6_managed() {
     fi
 
     current_prefix="$(cat "$IPV6_PREFIX_FILE" 2>/dev/null)"
-    if [ "$current_prefix" != "$prefix" ]; then
+    current_mode="$(cat "$IPV6_MODE_FILE" 2>/dev/null)"
+    if [ "$current_prefix" != "$prefix" ] || [ "$current_mode" != managed ]; then
         stop_ipv6_downstream
         # RouterOS learns a public WAN address and default route from this RA.
         # Its own firewall performs NAT66 from the managed LAN ULA. Android
@@ -1413,6 +1455,7 @@ sync_ipv6_managed() {
         ip -6 rule add priority "$IPV6_OUT_RULE_PRIO" iif "$WAN_TAP" lookup "$CELLULAR_ROUTE_TABLE"
         ip -6 rule add priority "$IPV6_IN_RULE_PRIO" iif "$CELLULAR_IFACE" to "$prefix/64" lookup main
         echo "$prefix" > "$IPV6_PREFIX_FILE"
+        echo managed > "$IPV6_MODE_FILE"
         sync_managed_ipv6_ra_block
         withdraw_native_ipv6_ra "$prefix"
     fi
@@ -3092,6 +3135,48 @@ dhcp_pool_ranges() {
     '
 }
 
+# Everything the managed-IPv6 branch adds, undone.  Kept separate so both the
+# standalone branch and the passthrough branch can call it: a prefix left
+# advertised after a switch would race Android's own RA on the same segment.
+# /ipv6 nd is matched by interface, not by comment -- RouterOS overwrites the
+# comment on that table with its own status text (verified on-device), so a
+# comment lookup silently finds nothing.
+sync_ipv6_teardown_cli() {
+    printf '/ipv6 firewall nat remove [find where comment="rosq-nat66"]\n'
+    printf '/ipv6 nd remove [find where interface=%s]\n' "$ROS_LAN_IFACE"
+    printf '/ipv6 nd set [find where interface=all] disabled=no\n'
+    printf '/ipv6 address remove [find where comment="rosq-lan-ula"]\n'
+    printf '/ipv6 settings set accept-router-advertisements=yes-if-forwarding-disabled\n'
+}
+
+sync_ipv6_managed_cli() {
+    sync_ula="$(ros_ula_prefix)"
+    sync_ula_addr="$sync_ula::1"
+    # Start from the teardown so repeated syncs replace our objects instead of
+    # stacking a second address/nd entry on the same interface.
+    sync_ipv6_teardown_cli
+    # CHR forwards, and the RouterOS default for this setting is
+    # "yes-if-forwarding-disabled", i.e. RAs are ignored on a router.  Without
+    # this the WAN NIC never SLAACs a global address and NAT66 has no source
+    # address to translate to.
+    printf '/ipv6 settings set forward=yes accept-router-advertisements=yes\n'
+    printf '/ipv6 address add address=%s/64 interface=%s advertise=yes comment="rosq-lan-ula"\n' \
+        "$sync_ula_addr" "$ROS_LAN_IFACE"
+    # ra-lifetime matters more than it looks: Android 15+ sets
+    # accept_ra_min_lft=180 and drops any RA advertising less.  RouterOS's 30m
+    # default clears that bar; the host's ra6 helper (45s) does not, which is
+    # why phones saw no IPv6 while laptops did.
+    printf '/ipv6 nd add interface=%s ra-lifetime=30m advertise-dns=yes dns=%s comment="rosq-lan-nd"\n' \
+        "$ROS_LAN_IFACE" "$sync_ula_addr"
+    # The default entry covers "all" interfaces, which would also advertise
+    # RouterOS as a router towards Android on the WAN link.
+    printf '/ipv6 nd set [find where interface=all] disabled=yes\n'
+    # Single carrier /64 and no prefix delegation, so the LAN ULA has to be
+    # translated on the way out.
+    printf '/ipv6 firewall nat add chain=srcnat out-interface=%s action=masquerade comment="rosq-nat66"\n' \
+        "$ROS_WAN_IFACE"
+}
+
 sync_network_config() {
     load_config
     sync_ip="${1:-$LAN_GUEST_IP}"
@@ -3116,6 +3201,14 @@ sync_network_config() {
     sync_in="$VM_DIR/network-sync.in"
     sync_log="$VM_DIR/network-sync.log"
     {
+        # Give the NICs meaningful names before anything references them.
+        # "default-name" is read-only and keeps saying ether1/ether2 however
+        # often the interface is renamed, so this is idempotent and also
+        # repairs an install still carrying the original names.  Which NIC is
+        # which follows from the qemu argument order (wan0 netdev first);
+        # verified on-device: ether1 carries WAN_MAC, ether2 LAN_MAC.
+        printf '/interface set [find default-name=ether1] name=%s\n' "$ROS_WAN_IFACE"
+        printf '/interface set [find default-name=ether2] name=%s\n' "$ROS_LAN_IFACE"
         # Drop any previous plug-in-managed address on the LAN NIC first, so
         # changing LAN_GUEST_IP replaces the old one instead of stacking.
         printf '/ip address remove [find where interface=%s]\n' "$ROS_LAN_IFACE"
@@ -3149,6 +3242,7 @@ sync_network_config() {
             # No clients on this segment in standalone mode, so RouterOS has
             # no reason to answer DNS for anyone but itself.
             printf '/ip dns set allow-remote-requests=no\n'
+            sync_ipv6_teardown_cli
         else
             # Android only masquerades WAN_SUBNET, so client traffic has to
             # leave RouterOS already translated to WAN_GUEST_IP or it is
@@ -3172,6 +3266,13 @@ sync_network_config() {
                     "$sync_lan_cidr" "$sync_ip" "$sync_ip"
                 printf '/ip dhcp-server add name=%s interface=%s address-pool=%s lease-time=%s disabled=no\n' \
                     "$sync_dhcp_name" "$ROS_LAN_IFACE" "$sync_pool_name" "$ROS_DHCP_LEASE"
+            fi
+            if [ "$IPV6_PASSTHROUGH" = 1 ]; then
+                # Android keeps owning downstream IPv6 in passthrough mode, so
+                # RouterOS must not advertise a competing prefix.
+                sync_ipv6_teardown_cli
+            else
+                sync_ipv6_managed_cli
             fi
         fi
         printf ':if ([:len [/ip address find where address="%s"]] > 0) do={ :put "__NETWORK_SYNC_OK__" } else={ :put "__NETWORK_SYNC_ERROR__=address not applied" }\n' "$sync_addr"

@@ -634,3 +634,97 @@ guest=.200（池尾）      -> …100-…199
 没在设备上切模式（会断网）。用本地 harness 把 `sync_network_config` 的
 脚本生成部分单独跑出来，两种模式的 CLI 都逐行核对过；`dhcp_pool_ranges`
 的边界情况单独测了 8 组。**真机切换未测**，第一次切建议留 adb 兜底。
+
+---
+
+## 接口改名 ether1/ether2 → wan/lan
+
+同步脚本开头先下发：
+
+```
+/interface set [find default-name=ether1] name=wan
+/interface set [find default-name=ether2] name=lan
+```
+
+`default-name` 是只读属性，无论改名多少次都还是 `ether1`/`ether2`，所以这两条是
+幂等的，也能修复仍在用旧名字的安装。哪块网卡是哪个由 qemu 参数顺序决定（`wan0`
+netdev 在前），设备上核对过：`ether1` 的 MAC 是 `WAN_MAC`、`ether2` 是 `LAN_MAC`。
+
+实测改名后 RouterOS 内部的引用**会自动跟随**（按 id 引用而非名字字符串）：
+
+```
+/ip firewall nat   chain=srcnat action=masquerade out-interface=wan
+/ip dhcp-server    rosq-lan-dhcp  lan  rosq-lan-pool
+/ip address        192.168.42.253/24 → lan   192.168.66.2/24 → wan
+```
+
+## 手机拿不到 IPv6：ra6 的 RA 生存期过短
+
+现象：USB 上的笔记本有公网 IPv6，WiFi 上的手机全都没有。
+
+抓包看 `ra6` 发出的 RA：
+
+```
+pref low, router lifetime 45s
+prefix <运营商/64> [onlink, auto], valid 120s, pref 45s
+（无 RDNSS）
+```
+
+**Android 15 起把 `accept_ra_min_lft` 设为 180 秒，生存期低于该值的 RA 整条丢弃。**
+45s 远低于门槛，所以新手机等于从未收到过 RA；macOS 无此过滤，照常工作。
+
+排除过的其他可能（都不是）：wlan0 上没跑 ra6、RA 没发出 wlan0、网桥挡组播、
+Android 在 usb0 另发了更好的 RA、v6 转发路径断。两个口收到的 RA 字节级相同。
+
+`ra6` 是剥符号的静态二进制，用法只有 `ra6 OUTPUT_IF ROUTER_IF PREFIX`，没有生存期
+参数；`.rodata` 里也搜不到 RA 模板字节（值是代码里的立即数），无法安全 patch。
+
+## managed 模式：客户机侧补完
+
+`sync_network_config` 原先一条 `/ipv6` 都不下发，所以关掉直通等于客户端彻底没有
+IPv6（Android 的 RA 被屏蔽、RouterOS 又不发）。现在网关分支按 `IPV6_PASSTHROUGH`
+分流，managed 时下发：
+
+```
+/ipv6 settings set forward=yes accept-router-advertisements=yes
+/ipv6 address add address=<ULA>::1/64 interface=lan advertise=yes comment="rosq-lan-ula"
+/ipv6 nd add interface=lan ra-lifetime=30m advertise-dns=yes dns=<ULA>::1 comment="rosq-lan-nd"
+/ipv6 nd set [find where interface=all] disabled=yes
+/ipv6 firewall nat add chain=srcnat out-interface=wan action=masquerade comment="rosq-nat66"
+```
+
+独立分支与直通分支调用同一个 `sync_ipv6_teardown_cli`，与上面严格 1:1 对称。
+
+几个实测得到的约束：
+
+* **`accept-router-advertisements` 必须显式设 `yes`。** RouterOS 默认
+  `yes-if-forwarding-disabled`，而 CHR `forward=yes`，等于不接受 RA —— WAN 口就
+  拿不到公网 v6，NAT66 也就没有可用的源地址。
+* **`/ipv6 nd` 不能按 comment 查找删除。** RouterOS 会用自己的状态文本覆盖该表的
+  comment（实测 `find where comment="rosq-lan-nd"` 返回 0），所以按 `interface=`
+  匹配；默认那条是 `interface=all`，不会被误伤。
+* **`advertise-dns=yes` 必须配合显式 `dns=`。** 只开 `advertise-dns` 时 RA 里的
+  RDNSS 生存期是 **0**（即"停止使用该 DNS"），并伴随
+  `automatic dns option advertising is not started` 警告，重新下发 `/ip dns set`
+  也不恢复。显式给 `dns=<ULA>::1` 后 RDNSS 生存期变为 1800s。
+* **默认那条 `interface=all` 的 nd 要禁用**，否则 RouterOS 也会朝 WAN 侧（Android）
+  宣告自己是路由器。
+
+## 为什么 LAN 用 ULA 而不是运营商 /64
+
+运营商只给一个 /64 且**没有 PD**，RouterOS 无法切出第二段给 LAN。
+
+理论上可以让 LAN 直接用那个公网 /64（客户端拿公网地址、免 NAT66），但
+`sync_network_config` 只能经 `maint_run`（离线维护引导）写入 RouterOS —— 前缀一变
+就要重启一次虚拟机。实测该前缀确实会变（`a13:36d6` → `a20:2202`）。
+
+ULA 则完全静态：RouterOS 侧写一次即可，WAN 侧的公网地址由 SLAAC 自动跟随前缀变化，
+不需要任何配置推送。代价是 NAT66。
+
+## 模式切换的状态跟踪
+
+`sync_ipv6_passthrough` / `sync_ipv6_managed` 原先只比对前缀，于是**前缀未变而模式
+改变时整段 teardown 被跳过**——两种模式把 `fe80::1`、`/64` 路由和策略规则挂在不同
+接口上（ros-br vs ros-wan），跳过就会留下上一模式的接线，且旧的下游 ra6 进程继续
+发 45s 的 RA，与 RouterOS 的 RA 打架。新增 `$VM_DIR/ipv6-mode` 单独记录模式，前缀或
+模式任一变化都触发完整 teardown。

@@ -37,7 +37,9 @@ LAN_MAC='52:54:00:6d:05:02'
 CELLULAR_IFACE='auto'
 CELLULAR_ROUTE_TABLE='auto'
 NETWORK_MONITOR='1'
-IPV6_PASSTHROUGH='0'
+IPV6_PASSTHROUGH='0'         # 1=Android 直通（客户端拿公网 v6）
+                             # 0=RouterOS 下发（LAN 用 ULA + NAT66）
+ROS_ULA_PREFIX=''            # 留空则从 LAN_MAC 推导，形如 fdXX:XXXX:XXXX
 AUTO_TAKEOVER='0'            # 仅网关模式有效，且会禁用 UFI 自身 IPv6
 USB_REPLUG='1'
 WIFI_DEAUTH='1'
@@ -45,8 +47,8 @@ WIFI_DEAUTH='1'
 # ---- 客户机内的 RouterOS ----
 ROS_USER='admin'
 ROS_PASSWORD=''
-ROS_WAN_IFACE='ether1'
-ROS_LAN_IFACE='ether2'
+ROS_WAN_IFACE='wan'          # 出厂是 ether1，同步时按 default-name 改名
+ROS_LAN_IFACE='lan'          # 出厂是 ether2
 ROS_DNS='223.5.5.5,119.29.29.29'
 ROS_DHCP_ENABLED='1'         # 以下四项仅网关模式下会下发
 ROS_DHCP_POOL_START='100'

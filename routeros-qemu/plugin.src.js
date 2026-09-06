@@ -59,8 +59,9 @@
     ROS_USER: 'admin',
     ROS_PASSWORD: '',
     ROS_DNS: '223.5.5.5,119.29.29.29',
-    ROS_WAN_IFACE: 'ether1',
-    ROS_LAN_IFACE: 'ether2',
+    ROS_WAN_IFACE: 'wan',
+    ROS_LAN_IFACE: 'lan',
+    ROS_ULA_PREFIX: '',
     ROS_DHCP_ENABLED: '1',
     ROS_DHCP_POOL_START: '100',
     ROS_DHCP_POOL_END: '200',
@@ -1225,7 +1226,7 @@ echo __UNINSTALL_OK__
     // TETHER_MODE has a single option on the ZTE build, so greying it out
     // would just look broken; leave it visible there.
     const gatewayOnly = [...(ZTE ? [] : ['TETHER_MODE']), 'AUTO_TAKEOVER', 'IPV6_PASSTHROUGH', 'NETWORK_MONITOR',
-      'ROS_DHCP_ENABLED', 'ROS_DHCP_POOL_START', 'ROS_DHCP_POOL_END', 'ROS_DHCP_LEASE'];
+      'ROS_DHCP_ENABLED', 'ROS_DHCP_POOL_START', 'ROS_DHCP_POOL_END', 'ROS_DHCP_LEASE', 'ROS_ULA_PREFIX'];
     const standalone = String(state.config.STANDALONE) === '1';
     for (const key of gatewayOnly) {
       const el = q(`[data-key="${key}"]`);
@@ -1462,7 +1463,8 @@ CPU 绑核
               ${field('DHCP 池起始（末位）', 'ROS_DHCP_POOL_START', 'number')}
               ${field('DHCP 池结束（末位）', 'ROS_DHCP_POOL_END', 'number')}
               ${field('租约时长', 'ROS_DHCP_LEASE')}
-              ${select('IPv6 透传', 'IPV6_PASSTHROUGH', [['0', '关闭'], ['1', '开启']])}
+              ${select('IPv6 下发方式', 'IPV6_PASSTHROUGH', [['1', 'Android 直通（客户端拿公网地址）'], ['0', 'RouterOS 下发（ULA + NAT66）']])}
+              ${field('RouterOS LAN ULA 前缀（留空自动推导）', 'ROS_ULA_PREFIX')}
               ${ZTE
                 ? select('接入模式（中兴专用版锁定）', 'TETHER_MODE', [['directbr0', 'directbr0（直绑原生 br0）']])
                 : select('接入模式', 'TETHER_MODE', [['bridge', 'bridge'], ['auto', 'auto'], ['routed', 'routed'], ['proxyarp', 'proxyarp'], ['directbr0', 'directbr0']])}

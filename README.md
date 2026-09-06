@@ -14,17 +14,21 @@ UFI 是一类基于 Android 的随身 WiFi。这个项目把一台 RouterOS CHR 
 
 ```
                 ros-wan (点对点)
- RouterOS ether1 ─────────────── 192.168.66.1  Android ──→ 蜂窝上网
+ RouterOS wan ───────────────── 192.168.66.1  Android ──→ 蜂窝上网
                                      (MASQUERADE)
 
- RouterOS ether2 ─── ros-lan ─── ros-br  192.168.42.1
+ RouterOS lan ────── ros-lan ─── ros-br  192.168.42.1
                                     │
                                     └─ 网关模式下：热点 wlan0 / USB usb0 也挂上来
                                        客户端与 RouterOS 同一个二层
 ```
 
-- **ether1 是上行**，对端只有 Android，走它的蜂窝口出网。
-- **ether2 是客户端侧**，RouterOS 在这里是 `192.168.42.253`。
+- **`wan` 是上行**，对端只有 Android，走它的蜂窝口出网。
+- **`lan` 是客户端侧**，RouterOS 在这里是 `192.168.42.253`。
+
+两块网卡出厂叫 `ether1`/`ether2`，插件同步时会按 `default-name` 重命名为 `wan`/`lan`
+（幂等，改几次都不会错位）。RouterOS 内部按 id 引用接口，所以防火墙、DHCP、地址这些
+配置会自动跟着改名走。
 
 ### 两种模式
 
