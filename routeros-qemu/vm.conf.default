@@ -1,0 +1,65 @@
+# RouterOS QEMU 管理插件 —— 默认配置参考
+#
+# 这个文件只是文档，脚本和插件都不会读它。真实的默认值有两处：
+#   * 插件安装时写出的 vm.conf —— plugin.src.js 的 DEFAULTS（下面照抄的就是它）
+#   * 缺键时的脚本兜底      —— routeros.sh 里的 : "${KEY:=...}"
+# 两者不完全相同：脚本兜底是给手工删过键的 vm.conf 兜底用的。
+# 平时请在插件界面里改，不要手抄这个文件。
+
+ROOT_DEVICE='/dev/vda'
+DISK_SIZE='1G'
+
+# ---- 虚拟机资源 ----
+VM_CPUS='4'
+VM_CPU_AFFINITY='auto'
+VM_MEMORY_MIB='384'
+VM_NET_QUEUES='auto'
+VM_VHOST='auto'              # auto/on/off，设备无 /dev/vhost-net 时自动 off
+MACHINE='virt'
+CPU_MODEL='host'
+ACCEL='kvm'
+RNG_ENABLED='1'
+USB_BUS_ENABLED='1'
+QEMU_PATH='auto'
+QEMU_EXTRA_ARGS=''
+FIRMWARE_PATH='auto'
+FIRMWARE_VARS_PATH='auto'
+
+# ---- 网络 ----
+STANDALONE='1'               # 1=独立设备模式  0=网关模式（接管热点客户端）
+TETHER_MODE='bridge'         # 中兴专用版默认 directbr0
+TETHER_IFACE_PATTERNS='auto'
+LAN_HOST_IP=''               # 留空则取 UFI 后台的 lan_ipaddr
+LAN_GUEST_IP='192.168.42.253'
+LAN_NETMASK='255.255.255.0'
+WAN_MAC='52:54:00:6d:05:01'
+LAN_MAC='52:54:00:6d:05:02'
+CELLULAR_IFACE='auto'
+CELLULAR_ROUTE_TABLE='auto'
+NETWORK_MONITOR='1'
+IPV6_PASSTHROUGH='0'
+AUTO_TAKEOVER='0'            # 仅网关模式有效，且会禁用 UFI 自身 IPv6
+USB_REPLUG='1'
+WIFI_DEAUTH='1'
+
+# ---- 客户机内的 RouterOS ----
+ROS_USER='admin'
+ROS_PASSWORD=''
+ROS_WAN_IFACE='ether1'
+ROS_LAN_IFACE='ether2'
+ROS_DNS='223.5.5.5,119.29.29.29'
+ROS_DHCP_ENABLED='1'         # 以下四项仅网关模式下会下发
+ROS_DHCP_POOL_START='100'
+ROS_DHCP_POOL_END='200'
+ROS_DHCP_LEASE='1h'
+
+# ---- 端口映射（宿主端口 -> 客户机）----
+SSH_DNAT_PORT='2224'         # -> 22
+WEB_DNAT_PORT='8081'         # -> 80   Webfig
+WINBOX_DNAT_PORT='8291'      # -> 8291 WinBox
+
+# ---- 串口终端 ----
+TTYD_ENABLED='1'
+TTYD_BIND='0.0.0.0'
+TTYD_PORT='7682'
+TTYD_CREDENTIAL=''           # 安装时随机生成；绑非 loopback 而留空会拒绝启动

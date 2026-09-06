@@ -1,0 +1,169 @@
+<!doctype html><meta charset="utf-8"><title>RouterOS QEMU 插件界面预览</title>
+<style>
+body{background:#0e1116;color:#d6dde6;font-family:system-ui,-apple-system,sans-serif;margin:0;padding:16px}
+input,select,button{background:#1a2029;color:#d6dde6;border:1px solid #2f3a47;border-radius:4px;padding:3px 6px;font-size:.7rem;font-family:inherit}
+button{cursor:pointer;padding:4px 10px}
+code{background:#1a2029;padding:1px 4px;border-radius:3px}
+
+      #kano_routeros_qemu_modal .rosq-wrap{font-size:.72rem;line-height:1.5}
+      #kano_routeros_qemu_modal .rosq-scroll{max-height:64vh;overflow:auto;padding-right:4px}
+      #kano_routeros_qemu_modal .rosq-card{border:1px solid #2a3340;border-radius:8px;padding:9px 11px;margin-bottom:9px}
+      #kano_routeros_qemu_modal .rosq-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:7px}
+      #kano_routeros_qemu_modal .rosq-title{font-weight:800}
+      #kano_routeros_qemu_modal .rosq-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:7px}
+      #kano_routeros_qemu_modal .rosq-field{display:flex;flex-direction:column;gap:3px;min-width:0}
+      /* Caption rule must not swallow the checkbox row: ".rosq-field>label"
+         outranks ".rosq-check" on specificity, so exclude it explicitly. */
+      #kano_routeros_qemu_modal .rosq-field>label:not(.rosq-check){opacity:.75;font-size:.66rem}
+      /* Only stretch real inputs: a checkbox at width:100% renders as a wide
+         box and drags its text out of alignment with the neighbouring cells. */
+      #kano_routeros_qemu_modal .rosq-field input:not([type="checkbox"]),
+      #kano_routeros_qemu_modal .rosq-field select{width:100%;box-sizing:border-box}
+      /* Checkbox cells have no caption row, so bottom-align them with the
+         input boxes in the same grid row. */
+      #kano_routeros_qemu_modal .rosq-field-check{justify-content:flex-end}
+      #kano_routeros_qemu_modal .rosq-check{display:flex;align-items:center;gap:6px;font-size:.66rem;opacity:.9;cursor:pointer;min-height:24px;line-height:1.2}
+      #kano_routeros_qemu_modal .rosq-check input[type="checkbox"]{width:auto;flex:0 0 auto;margin:0}
+      #kano_routeros_qemu_modal .rosq-check span{flex:1 1 auto}
+      #kano_routeros_qemu_modal .rosq-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+      #kano_routeros_qemu_modal .rosq-empty{opacity:.6;padding:6px 0}
+      #kano_routeros_qemu_modal .rosq-dim{opacity:.6;font-size:.64rem}
+      #kano_routeros_qemu_modal .rosq-table{width:100%;border-collapse:collapse;font-size:.66rem}
+      #kano_routeros_qemu_modal .rosq-table th,#kano_routeros_qemu_modal .rosq-table td{border-bottom:1px solid #232b36;padding:3px 4px;text-align:left}
+      #kano_routeros_qemu_modal .rosq-usb-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid #232b36;flex-wrap:wrap}
+      #kano_routeros_qemu_modal .rosq-usb-row>div:last-child{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+      /* The auto-passthrough toggle sits next to a button, so keep it from
+         growing and pushing the button off the row. */
+      #kano_routeros_qemu_modal .rosq-usb-row .rosq-check{white-space:nowrap}
+      #kano_routeros_qemu_modal .rosq-usb-row .rosq-check span{flex:0 0 auto}
+      #kano_routeros_qemu_modal .rosq-table td input[type="checkbox"]{margin:0;vertical-align:middle}
+      #kano_routeros_qemu_modal .rosq-table td{vertical-align:middle}
+      #kano_routeros_qemu_modal .rosq-progress-bar{height:5px;background:#222b36;border-radius:3px;overflow:hidden}
+      #kano_routeros_qemu_modal .rosq-progress-fill{height:100%;width:0;background:#4a9eff;transition:width .3s}
+      #kano_routeros_qemu_modal .rosq-banner{border:1px solid #3a4757;background:#182028;border-radius:8px;padding:8px 10px;margin-bottom:9px;font-size:.66rem}
+    
+</style>
+<div id="kano_routeros_qemu_modal" style="max-width:840px;margin:0 auto">
+      <div class="rosq-wrap">
+        <div class="rosq-card" id="rosq_progress" style="display:none">
+          <div class="rosq-head"><span class="rosq-title">操作进度</span><span id="rosq_progress_pct">0%</span></div>
+          <div id="rosq_progress_text" class="rosq-dim" style="margin-bottom:5px">空闲</div>
+          <div class="rosq-progress-bar"><div class="rosq-progress-fill" id="rosq_progress_fill"></div></div>
+        </div>
+        <div class="rosq-scroll">
+          <div class="rosq-banner">RouterOS CHR 走 <b>QEMU + UEFI + KVM</b>（crosvm 不支持 pflash，起不了 CHR）。
+            默认<b>独立设备模式</b>不接管客户端流量；切到<b>网关模式</b>后热点 / USB / 转网口客户端由 RouterOS 转发。
+            RouterOS 用 SSH / Webfig / WinBox 远程配置，本插件不提供图形控制台。</div>
+
+          <div class="rosq-card">
+            <div class="rosq-head"><span class="rosq-title">运行状态</span><span id="rosq_busy">空闲</span></div>
+            <div>状态：<b id="rosq_status">检测中…</b></div>
+            <div class="rosq-dim" id="rosq_detail" style="margin-top:4px;word-break:break-all">—</div>
+            <div class="rosq-actions">
+              <button id="rosq_toggle">启动</button>
+              <button id="rosq_restart">重启</button>
+              <button id="rosq_preflight">运行预检</button>
+              <button id="rosq_logs">查看日志</button>
+              <button id="rosq_boot">开机自启</button>
+              <button id="rosq_help">使用帮助</button>
+            </div>
+          </div>
+
+          <div class="rosq-card">
+            <div class="rosq-head"><span class="rosq-title">安装与资源包</span></div>
+            <div class="rosq-form">
+              <div class="rosq-field" style="grid-column:1/-1">
+                <label>在线资源包地址（自包含：qemu + edk2 + routeros.img）</label>
+                <input id="rosq_package_url" value="https://pan.kanokano.cn/d/UFI-TOOLS-UPDATE/plugins/routeros-qemu-vm-arm64.tar.gz">
+              </div>
+            </div>
+            <div class="rosq-dim">本地安装会打开浏览器文件选择框，上传 <code>routeros-qemu-vm-arm64.tar.gz</code> 后自动安装并清理上传副本。</div>
+            <div class="rosq-actions">
+              <button id="rosq_install">在线安装 / 更新资源</button>
+              <button id="rosq_install_local">从本地上传安装…</button>
+              <button id="rosq_update_script">仅更新脚本</button>
+            </div>
+          </div>
+
+          <div class="rosq-card">
+            <div class="rosq-head"><span class="rosq-title">网络</span></div>
+            <div class="rosq-form">
+              <div class="rosq-field"><label>运行模式</label><select data-key="STANDALONE"><option value="1">独立设备模式（默认）</option><option value="0">网关模式（接管客户端）</option></select></div>
+              <div class="rosq-field"><label>UFI 地址 LAN_HOST_IP</label><input data-key="LAN_HOST_IP" type="text"></div>
+              <div class="rosq-field"><label>RouterOS 地址 LAN_GUEST_IP</label><input data-key="LAN_GUEST_IP" type="text"></div>
+              <div class="rosq-field"><label>子网掩码</label><input data-key="LAN_NETMASK" type="text"></div>
+              <div class="rosq-field"><label>SSH 转发端口</label><input data-key="SSH_DNAT_PORT" type="number"></div>
+              <div class="rosq-field"><label>Webfig 转发端口</label><input data-key="WEB_DNAT_PORT" type="number"></div>
+              <div class="rosq-field"><label>IPv6 透传</label><select data-key="IPV6_PASSTHROUGH"><option value="0">关闭</option><option value="1">开启</option></select></div>
+              <div class="rosq-field"><label>接入模式</label><select data-key="TETHER_MODE"><option value="bridge">bridge</option><option value="auto">auto</option><option value="routed">routed</option><option value="proxyarp">proxyarp</option><option value="directbr0">directbr0</option></select></div>
+              <div class="rosq-field rosq-field-check"><label class="rosq-check"><input data-key="AUTO_TAKEOVER" type="checkbox"><span>启动时自动接管 Android 流量</span></label></div>
+              <div class="rosq-field rosq-field-check"><label class="rosq-check"><input data-key="NETWORK_MONITOR" type="checkbox"><span>网络监控（自动同步网桥端口）</span></label></div>
+            </div>
+            <div class="rosq-dim" id="rosq_mode_hint" style="margin-top:6px"></div>
+            <div class="rosq-dim" style="margin-top:4px">改地址或切模式需要停机写入 RouterOS 磁盘，保存时会自动完成并恢复原状态。</div>
+          </div>
+
+          <div class="rosq-card">
+            <div class="rosq-head"><span class="rosq-title">虚拟机资源</span></div>
+            <div class="rosq-form">
+              <div class="rosq-field"><label>vCPU</label><input data-key="VM_CPUS" type="number"></div>
+              <div class="rosq-field"><label>内存（MiB）</label><input data-key="VM_MEMORY_MIB" type="number"></div>
+              <div class="rosq-field"><label>CPU 绑核（auto / none / 6,7）</label><input data-key="VM_CPU_AFFINITY" type="text"></div>
+              <div class="rosq-field"><label>网卡队列（auto 或整数）</label><input data-key="VM_NET_QUEUES" type="text"></div>
+              <div class="rosq-field"><label>加速器</label><select data-key="ACCEL"><option value="kvm">kvm</option><option value="tcg">tcg（仅排错）</option></select></div>
+              <div class="rosq-field"><label>CPU 型号</label><input data-key="CPU_MODEL" type="text"></div>
+              <div class="rosq-field rosq-field-check"><label class="rosq-check"><input data-key="RNG_ENABLED" type="checkbox"><span>virtio-rng</span></label></div>
+              <div class="rosq-field rosq-field-check"><label class="rosq-check"><input data-key="USB_BUS_ENABLED" type="checkbox"><span>USB 控制器（直通所需）</span></label></div>
+              <div class="rosq-field" style="grid-column:1/-1"><label>QEMU 附加参数</label><input data-key="QEMU_EXTRA_ARGS"></div>
+            </div>
+          </div>
+
+          <div class="rosq-card">
+            <div class="rosq-head"><span class="rosq-title">端口映射</span></div>
+            <div id="rosq_forwards"></div>
+            <div class="rosq-actions"><button id="rosq_add_forward">新增映射</button></div>
+          </div>
+
+          <div class="rosq-card">
+            <div class="rosq-head"><span class="rosq-title">USB 直通</span><button id="rosq_usb_refresh">刷新列表</button></div>
+            <div id="rosq_usb_list"></div>
+          </div>
+
+          <div class="rosq-card">
+            <div class="rosq-head"><span class="rosq-title">虚拟磁盘与备份</span></div>
+            <div id="rosq_disk_summary" class="rosq-dim">—</div>
+            <div class="rosq-dim">备份目录：/sdcard/DroidVM_UFI/BACKUP（镜像操作期间会停机）</div>
+            <div class="rosq-actions">
+              <button id="rosq_expand_disk">扩容磁盘</button>
+              <button id="rosq_reclaim_disk">回收宿主空间</button>
+              <button id="rosq_backup">备份镜像</button>
+              <button id="rosq_restore">备份管理 / 恢复</button>
+            </div>
+          </div>
+
+          <div class="rosq-card">
+            <div class="rosq-head"><span class="rosq-title">串口终端（ttyd）</span></div>
+            <div class="rosq-form">
+              <div class="rosq-field rosq-field-check"><label class="rosq-check"><input data-key="TTYD_ENABLED" type="checkbox"><span>启用 ttyd</span></label></div>
+              <div class="rosq-field"><label>监听地址</label><input data-key="TTYD_BIND" type="text"></div>
+              <div class="rosq-field"><label>端口</label><input data-key="TTYD_PORT" type="number"></div>
+              <div class="rosq-field"><label>凭据 user:pass（公开监听时必填）</label><input data-key="TTYD_CREDENTIAL" type="text"></div>
+              <div class="rosq-field"><label>RouterOS 用户名</label><input data-key="ROS_USER" type="text"></div>
+              <div class="rosq-field"><label>RouterOS 密码（维护写盘用）</label><input data-key="ROS_PASSWORD" type="text"></div>
+            </div>
+            <div class="rosq-actions">
+              <button id="rosq_ttyd_open">打开终端</button>
+              <button id="rosq_ttyd_restart">重启 ttyd</button>
+              <button id="rosq_ttyd_stop">停止 ttyd</button>
+            </div>
+          </div>
+
+          <div class="rosq-card">
+            <div class="rosq-actions">
+              <button id="rosq_save">保存（下次启动生效）</button>
+              <button id="rosq_save_restart">保存并重启</button>
+              <button id="rosq_uninstall">卸载</button>
+            </div>
+          </div>
+        </div>
+      </div></div>
