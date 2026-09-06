@@ -1,7 +1,7 @@
 # RouterOS 插件 QEMU 化 — 后端移植说明
 
-基线：`ufi/routeros/routeros.sh`（crosvm 版，2046 行）
-产物：`ufi/routeros-qemu/routeros.sh`（QEMU 版，2928 行）
+基线：早先的 crosvm 版 `routeros.sh`（2046 行，已不在本仓库）
+产物：`ufi/routeros-qemu/routeros.sh`（QEMU 版）
 
 ## 为什么换 QEMU
 

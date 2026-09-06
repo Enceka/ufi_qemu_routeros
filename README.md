@@ -176,8 +176,6 @@ ufi/
    └─ PORT_NOTES.md        移植笔记与踩坑记录
 ```
 
-`ufi/routeros/` 是更早的 crosvm 版本，保留作参考。
-
 ---
 
 ## 备份
