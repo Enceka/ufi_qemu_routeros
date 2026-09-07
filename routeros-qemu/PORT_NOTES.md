@@ -805,3 +805,27 @@ RouterOS 作为默认 v6 路由器直到 `ra-lifetime` 到期（30 分钟）。
 重复开启幂等、关闭后清零。
 
 校验前后端一致（整数、上限 900），后端实测拒绝 `abc` / `-5` / `901`、接受 `30`。
+
+## 同步触发条件漏了新键
+
+`networkChanged` 原本只比对 `LAN_GUEST_IP` / `STANDALONE` / `ROS_DNS` /
+`ROS_DHCP_*`。加了 IPv6 之后没同步更新这个列表，于是在界面改 `IPV6_PASSTHROUGH`
+再保存，配置写进了 vm.conf、界面提示"已保存"，**但从不下发到 RouterOS** ——
+客户机行为完全没变。已补上 `IPV6_PASSTHROUGH` 和 `ROS_ULA_PREFIX`。
+
+接口改名是另一种情况，补列表也解决不了：`ROS_WAN_IFACE` 不在表单里，
+`collectForm()` 以 `state.config` 为底，而 `parseConfig` 在读取时就已经把
+`ether1` 迁移成 `wan` 了 —— 两边永远相等，比不出差异。
+
+所以加了「同步网络配置并重启」按钮（`syncNetworkNow`），主动跑一次同步。
+同步任务本身抽成 `runSyncJob()` 由保存路径和按钮共用，避免两份会漂移的实现。
+
+本地 dump 过它生成的 CLI，改名两行在最前、后续引用全部用 wan/lan：
+
+```
+/interface set [find default-name=ether1] name=wan
+/interface set [find default-name=ether2] name=lan
+/ip address add address="192.168.42.253/24" interface=lan
+/ip dhcp-server add name=rosq-lan-dhcp interface=lan …
+:if ([:len [/ip firewall nat find where … out-interface="wan" …]] = 0) do={ … }
+```

@@ -887,7 +887,12 @@ echo __SYNC_STAGE_DONE__
       || config.ROS_DHCP_ENABLED !== state.config.ROS_DHCP_ENABLED
       || config.ROS_DHCP_POOL_START !== state.config.ROS_DHCP_POOL_START
       || config.ROS_DHCP_POOL_END !== state.config.ROS_DHCP_POOL_END
-      || config.ROS_DHCP_LEASE !== state.config.ROS_DHCP_LEASE;
+      || config.ROS_DHCP_LEASE !== state.config.ROS_DHCP_LEASE
+      // These two decide which /ipv6 block sync_network_config emits.  Left
+      // out, switching the IPv6 mode would write vm.conf, report success, and
+      // never reach RouterOS -- the guest would keep the previous behaviour.
+      || config.IPV6_PASSTHROUGH !== state.config.IPV6_PASSTHROUGH
+      || config.ROS_ULA_PREFIX !== state.config.ROS_ULA_PREFIX;
 
     setBusy(true, '正在保存…');
     try {
@@ -902,16 +907,7 @@ echo __SYNC_STAGE_DONE__
         // Whether to restart afterwards is decided on the device, from the
         // state at that moment, not from what the UI last saw.
         setProgress('正在把网络配置写入 RouterOS 磁盘…', 30, true);
-        const sync = await runRootJob(`
-set -u
-WAS_RUNNING=0
-${shellQuote(MANAGER)} status >/dev/null 2>&1 && WAS_RUNNING=1
-[ "$WAS_RUNNING" = 0 ] || ${shellQuote(MANAGER)} stop >/dev/null 2>&1
-${shellQuote(MANAGER)} sync-network ${shellQuote(config.LAN_GUEST_IP)} ${shellQuote('255.255.255.0')} 2>&1
-SYNC_RC=$?
-[ "$WAS_RUNNING" = 0 ] || ${shellQuote(MANAGER)} start >/dev/null 2>&1
-exit "$SYNC_RC"
-`, 'save-sync', { successMarker: '__NETWORK_SYNC_OK__', timeout: 600000 });
+        const sync = await runSyncJob(config.LAN_GUEST_IP, 'save-sync');
         toast(sync.ok ? '已保存并同步到 RouterOS' : `保存成功，但网络同步失败：${sync.text.split('\n').filter(Boolean).slice(-2).join(' ')}`, sync.ok, 8000);
       } else if (restart && state.running) {
         setProgress('正在重启虚拟机…', 50, true);
@@ -1067,6 +1063,45 @@ exit "$RC"
     await refreshUsb();
   };
 
+  // The guest-side settings (LAN address, interface names, DHCP server, the
+  // /ipv6 block) live inside RouterOS's own config, which can only be written
+  // with the VM stopped -- sync boots a throwaway maintenance instance to do
+  // it.  Whether to start the VM again afterwards is decided on the device
+  // from the state at that moment, not from what the UI last saw.
+  const runSyncJob = (guestIp, label) => runRootJob(`
+set -u
+WAS_RUNNING=0
+${shellQuote(MANAGER)} status >/dev/null 2>&1 && WAS_RUNNING=1
+[ "$WAS_RUNNING" = 0 ] || ${shellQuote(MANAGER)} stop >/dev/null 2>&1
+${shellQuote(MANAGER)} sync-network ${shellQuote(guestIp)} ${shellQuote('255.255.255.0')} 2>&1
+SYNC_RC=$?
+[ "$WAS_RUNNING" = 0 ] || ${shellQuote(MANAGER)} start >/dev/null 2>&1
+exit "$SYNC_RC"
+`, label, { successMarker: '__NETWORK_SYNC_OK__', timeout: 600000 });
+
+  // Saving only syncs when a guest-side key actually changed.  That leaves no
+  // way to push settings the form cannot compare -- the NIC names migrated on
+  // read, or a config the device drifted away from -- so offer it explicitly.
+  const syncNetworkNow = async () => {
+    if (state.busy) return toast('有操作正在进行', false);
+    if (!state.installed) return toast('请先安装资源包', false);
+    if (!await confirmAsk('rosq_sync_now', '同步网络配置到 RouterOS',
+      '会<strong>停止虚拟机</strong>，启动一次维护实例把 LAN 地址、接口名（wan/lan）、'
+      + 'DHCP 服务器和 IPv6 配置写入 RouterOS 磁盘，然后恢复原来的运行状态。'
+      + '<br><br>期间客户端会短暂断网，通常一两分钟。', '开始同步', 5)) return;
+    setBusy(true, '正在同步…');
+    try {
+      setProgress('正在把网络配置写入 RouterOS 磁盘…', 30, true);
+      const sync = await runSyncJob(state.config.LAN_GUEST_IP, 'manual-sync');
+      toast(sync.ok
+        ? '网络配置已同步到 RouterOS'
+        : `同步失败：${sync.text.split('\n').filter(Boolean).slice(-2).join(' ')}`, sync.ok, 8000);
+    } finally {
+      setBusy(false);
+      await refresh();
+    }
+  };
+
   // ---- boot autostart ----
   // Both spellings are stripped before (re)writing, so toggling an install
   // that still carries the legacy line upgrades it instead of ending up with
@@ -1157,7 +1192,8 @@ echo __UNINSTALL_OK__
     if (importBtn) importBtn.disabled = state.busy || !state.installed;
     for (const id of ['rosq_restart', 'rosq_preflight', 'rosq_logs', 'rosq_save', 'rosq_save_restart',
       'rosq_expand_disk', 'rosq_reclaim_disk', 'rosq_backup', 'rosq_restore', 'rosq_uninstall',
-      'rosq_ttyd_open', 'rosq_ttyd_restart', 'rosq_ttyd_stop', 'rosq_boot', 'rosq_usb_refresh']) {
+      'rosq_ttyd_open', 'rosq_ttyd_restart', 'rosq_ttyd_stop', 'rosq_boot', 'rosq_usb_refresh',
+      'rosq_sync']) {
       const el = q(`#${id}`);
       if (el) el.disabled = state.busy || !state.installed;
     }
@@ -1505,6 +1541,12 @@ CPU 绑核
               ${check('网络监控（自动同步网桥端口）', 'NETWORK_MONITOR')}
             </div>
             <div class="rosq-dim" id="rosq_mode_hint" style="margin-top:6px"></div>
+            <div class="rosq-actions" style="margin-top:8px">
+              <button id="rosq_sync">同步网络配置并重启</button>
+            </div>
+            <div class="rosq-dim" style="margin-top:6px">保存设置时，只有改动了地址 / 模式 / DNS / DHCP / IPv6
+              才会自动同步。这个按钮可以主动把当前配置重新写入 RouterOS —— 从旧版升级后想让接口改名
+              （<code>ether1/2</code> → <code>wan/lan</code>）生效，或怀疑客户机配置和界面对不上时用。</div>
             <div class="rosq-dim" style="margin-top:4px">改地址或切模式需要停机写入 RouterOS 磁盘，保存时会自动完成并恢复原状态。</div>
           </div>
 
@@ -1587,6 +1629,7 @@ CPU 绑核
     el.querySelector('#rosq_logs').onclick = guard(showLogs, '查看日志');
     el.querySelector('#rosq_boot').onclick = guard(toggleBoot, '开机自启');
     el.querySelector('#rosq_takeover').onclick = guard(toggleTakeover, '接管 UFI 流量');
+    el.querySelector('#rosq_sync').onclick = guard(syncNetworkNow, '同步网络配置');
     el.querySelector('#rosq_install').onclick = guard(() => installFromPackage(el.querySelector('#rosq_package_url').value.trim(), false), '在线安装');
     el.querySelector('#rosq_install_local').onclick = guard(pickAndInstallLocal, '本地安装');
     el.querySelector('#rosq_import_disk').onclick = guard(importDiskImage, '导入 CHR 镜像');
