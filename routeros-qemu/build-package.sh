@@ -59,6 +59,30 @@ for f in garp ra6 kvm-probe dhcp-relay sparse-writer ttyd; do
   echo "    vendor/$f"
 done
 
+# ra6 ships with 45s RA lifetimes, which Android 15+ drops outright
+# (accept_ra_min_lft=180) -- phones then get no IPv6 while laptops do.  Patch it
+# here rather than at run time so the package is self-contained.  The patcher
+# matches an exact instruction sequence and no-ops on anything else, so an
+# unrecognised ra6 build is passed through untouched instead of corrupted.
+if command -v python3 >/dev/null; then
+  RA6_SRC="$VENDOR/ra6"
+  if [ ! -f "$RA6_SRC" ]; then
+    # No local copy: take the one already installed on the device.
+    adb shell "su -c 'cat /data/local/mikrotik/ra6'" > /tmp/rosq-ra6-src 2>/dev/null || true
+    [ -s /tmp/rosq-ra6-src ] && RA6_SRC=/tmp/rosq-ra6-src || RA6_SRC=""
+  fi
+  if [ -n "$RA6_SRC" ]; then
+    cp "$RA6_SRC" /tmp/rosq-ra6-patched
+    if ./patch-ra6.py /tmp/rosq-ra6-patched; then
+      adb push /tmp/rosq-ra6-patched /data/local/tmp/rosq-ra6 >/dev/null
+      echo "    ra6 (RA lifetimes patched)"
+    fi
+    rm -f /tmp/rosq-ra6-patched /tmp/rosq-ra6-src
+  fi
+else
+  echo "    !! python3 not found: shipping ra6 unpatched (Android 15+ will ignore its RAs)" >&2
+fi
+
 echo "==> assembling on device"
 adb shell "su -c '
 set -eu

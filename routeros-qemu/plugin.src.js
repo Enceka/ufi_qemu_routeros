@@ -68,7 +68,7 @@
     ROS_DHCP_LEASE: '1h',
     AUTO_TAKEOVER: '0',
     NETWORK_MONITOR: '1',
-    IPV6_PASSTHROUGH: '0',
+    IPV6_PASSTHROUGH: '1',
     CELLULAR_IFACE: 'auto',
     CELLULAR_ROUTE_TABLE: 'auto',
     TETHER_IFACE_PATTERNS: 'auto',
@@ -374,6 +374,14 @@
         if (m2 && CONFIG_KEYS.includes(m2[1])) out[m2[1]] = m2[2].replace(/^'|'$/g, '');
       }
     }
+    // Installs written before the NICs were renamed pin the old defaults, so
+    // preserving their vm.conf verbatim would leave them on ether1/ether2
+    // forever.  Only the exact old defaults are migrated -- a hand-picked name
+    // is the user's, and stays.  Safe to do on read: these two keys are used
+    // nowhere but the sync script, which renames by the read-only default-name
+    // before referencing them, so RouterOS follows along on the next sync.
+    if (out.ROS_WAN_IFACE === 'ether1') out.ROS_WAN_IFACE = 'wan';
+    if (out.ROS_LAN_IFACE === 'ether2') out.ROS_LAN_IFACE = 'lan';
     return out;
   };
   const serializeConfig = (config) => CONFIG_KEYS

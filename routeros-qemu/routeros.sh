@@ -1,7 +1,7 @@
 #!/system/bin/sh
 set -u
 
-MANAGER_VERSION=2026090701
+MANAGER_VERSION=2026090702
 
 # RouterOS CHR (ARM64) runs under QEMU/KVM, not crosvm: CHR boots through UEFI
 # (BOOTAA64.EFI in its ESP) and crosvm has no pflash/MMIO firmware path.  The
@@ -119,7 +119,7 @@ load_config() {
     : "${VM_MEMORY_MIB:=384}"
     : "${AUTO_TAKEOVER:=0}"
     : "${NETWORK_MONITOR:=1}"
-    : "${IPV6_PASSTHROUGH:=0}"
+    : "${IPV6_PASSTHROUGH:=1}"
     : "${QEMU_PATH:=auto}"
     : "${VM_VHOST:=auto}"
     : "${QEMU_EXTRA_ARGS:=}"
@@ -1283,6 +1283,23 @@ cellular_ipv6_prefix() {
         }'
 }
 
+# ra6 hard-codes the lifetimes it advertises and takes no options for them.  The
+# stock build says 45s, which Android 15+ drops outright (accept_ra_min_lft=180)
+# -- phones then get no IPv6 at all while laptops are fine, which is a miserable
+# thing to debug.  patch-ra6.py rewrites the three instructions holding those
+# constants; report which build is installed so a stale helper is visible.
+# Only the first 16 KiB is scanned: the sequence sits at ~0x7cc, well inside
+# ra6's own code, and hashing the whole 540 KiB on every preflight is wasteful.
+ra6_lifetime_state() {
+    [ -x "$RA6" ] || { echo missing; return 0; }
+    ra6_head="$(od -An -tx1 -v -N 16384 "$RA6" 2>/dev/null | tr -d ' \n')"
+    case "$ra6_head" in
+        *ea00a1728903e4f2c801a252*) echo patched ;;
+        *0aa0a5720900eff208a0a552*) echo short ;;
+        *) echo unknown ;;
+    esac
+}
+
 stop_ra6_port() {
     iface="$1"
     pidfile="$VM_DIR/ra6-$iface.pid"
@@ -2076,7 +2093,7 @@ preflight_vm() {
     fi
     [ -r "$FIRMWARE" ] || die "UEFI firmware is missing: $FIRMWARE"
     validate_forwards
-    echo "preflight ok: qemu=$QEMU firmware=$FIRMWARE accel=$ACCEL cpus=$VM_CPUS cpu_list=${EFFECTIVE_CPU_LIST:-none} mask=${EFFECTIVE_CPU_MASK:-none} net_queues=$EFFECTIVE_NET_QUEUES vhost=$EFFECTIVE_VHOST cellular=$CELLULAR_IFACE table=$CELLULAR_ROUTE_TABLE tether=${TETHER_IFACE_PATTERNS} mode=$EFFECTIVE_TETHER_MODE ipv6_passthrough=$IPV6_PASSTHROUGH"
+    echo "preflight ok: qemu=$QEMU firmware=$FIRMWARE accel=$ACCEL cpus=$VM_CPUS cpu_list=${EFFECTIVE_CPU_LIST:-none} mask=${EFFECTIVE_CPU_MASK:-none} net_queues=$EFFECTIVE_NET_QUEUES vhost=$EFFECTIVE_VHOST cellular=$CELLULAR_IFACE table=$CELLULAR_ROUTE_TABLE tether=${TETHER_IFACE_PATTERNS} mode=$EFFECTIVE_TETHER_MODE ipv6_passthrough=$IPV6_PASSTHROUGH ra6=$(ra6_lifetime_state)"
 }
 
 # crosvm pinned each vCPU with --cpu-affinity; QEMU has no equivalent, so ask

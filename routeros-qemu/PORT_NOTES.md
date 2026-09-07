@@ -728,3 +728,59 @@ ULA 则完全静态：RouterOS 侧写一次即可，WAN 侧的公网地址由 SL
 接口上（ros-br vs ros-wan），跳过就会留下上一模式的接线，且旧的下游 ra6 进程继续
 发 45s 的 RA，与 RouterOS 的 RA 打架。新增 `$VM_DIR/ipv6-mode` 单独记录模式，前缀或
 模式任一变化都触发完整 teardown。
+
+## 补丁 ra6：保住公网 IPv6
+
+前一节的结论（"改由 RouterOS 发 RA"）只解决了生存期，代价是客户端从公网地址退成
+ULA + NAT66。后来发现 ra6 其实可以精确补丁，于是公网地址能保住，managed 模式降级
+为可选项。
+
+三个生存期是三条相邻指令里的立即数，与抓包逐字段对得上：
+
+```
+mov  w11, #-0x7a              ; strb → [0xa6] = 0x86 = ICMPv6 type 134
+mov  w10, #0x1840
+movk w10, #0x2d00, lsl #16    ; stur → [0xaa..0xad] = 40 18 00 2d
+                              ;   hop=64  flags=0x18(pref low)  router lifetime=45
+mov  x9,  #0x403
+movk x9,  #0xc040, lsl #16
+movk x9,  #0x7800, lsl #48    ; stur → [0xb6..0xbd] = 03 04 40 c0 00 00 00 78
+                              ;   前缀选项 type=3 len=4 plen=64 flags=onlink|auto valid=120
+mov  w8,  #0x2d000000         ; stur → [0xbe..0xc1] = 00 00 00 2d  preferred=45
+```
+
+`patch-ra6.py` 按这 12 字节整体签名匹配（要求全文件唯一，实测偏移 `0x7cc`），
+改成 1800 / 7200 / 3600 秒。字段是大端进包的，所以立即数取其字节交换值。
+
+**编码上限 65535 秒**：valid/preferred 的 bits47:32 恒为 0（没有任何指令写它），
+再大就需要多插一条指令，原地补丁做不到。1800/7200/3600 远够用。
+
+实测（同一次抓包里前后两条）：
+
+```
+旧 ra6 :  router lifetime 45s,   valid 120s,  pref 45s
+补丁版 :  router lifetime 1800s, valid 7200s, pref 3600s
+```
+
+之后 REDMI-K90（Android 15）在邻居表里出现 `2409:…:aa6c:…` 且 `REACHABLE`，
+即手机拿到了公网 IPv6。
+
+安装形态：不改仓库里的 `vendor/ra6`（保持上游原样），补丁在 `build-package.sh`
+打包时施加；本地没有 vendor 副本时会从设备上把 ra6 拉下来补好再推回去。
+`ra6_lifetime_state()` 扫描前 16 KiB 判断 patched / short / unknown，
+`preflight` 输出 `ra6=…`，避免装了旧 helper 又静默踩同一个坑。
+
+`pref low` 没有动（保持最小补丁面）。它的含义是：**任何以 medium 宣告的路由器都会
+压过 ra6**。测试 managed 模式时 RouterOS 正是 medium，客户端于是把默认路由指向
+RouterOS；清掉 RouterOS 的 v6 配置后，那条路由变成黑洞。
+
+## managed 模式切回直通有 30 分钟空窗
+
+RouterOS **只在某个接口上存在 `advertise=yes` 的地址时才广播 RA**（实测：删掉 ULA
+地址后，即使 `/ipv6 nd` 条目还在、`ra-lifetime=0s` 也照样一个包都不发）。
+
+所以 `sync_ipv6_teardown_cli` 删掉地址的瞬间 RouterOS 就静默了，**发不出撤销**；
+而同步是离线维护引导，那一刻 RouterOS 根本不在网上，想撤也没机会。客户端会保留
+RouterOS 作为默认 v6 路由器直到 `ra-lifetime` 到期（30 分钟）。
+
+这条无解（除非把配置改成在线推送），已在 README 里写明，并把默认值定回直通。
