@@ -177,10 +177,21 @@ ufi/
    ├─ build-package.sh     组装资源包
    ├─ vm.conf.default      默认配置参考（仅文档，不被读取）
    ├─ ui-preview.html      界面预览，浏览器直接打开
+   ├─ patch-ra6.py         修正 ra6 的 RA 生存期（见 IPv6 一节）
    └─ PORT_NOTES.md        移植笔记与踩坑记录
 ```
 
 ---
+
+## 开机自启
+
+界面「运行状态」里点「开机自启」，会往 `/sdcard/ufi_tools_boot.sh` 写一行
+`routeros.sh boot`。旁边的**开机自启延迟**（0–900 秒）解决两件事：
+
+- 开机瞬间蜂窝、热点、USB 都还在初始化，立刻建网桥会和不断变化的接口赛跑
+- `boot` 把等待放进 detach 的子进程后立刻返回，所以**不管延迟设多久都不会拖慢开机**
+
+设 20–60 秒通常够。改完要点「保存设置」才写入。
 
 ## IPv6
 

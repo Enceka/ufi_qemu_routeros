@@ -40,6 +40,7 @@ NETWORK_MONITOR='1'
 IPV6_PASSTHROUGH='1'         # 1=Android 直通（客户端拿公网 v6）
                              # 0=RouterOS 下发（LAN 用 ULA + NAT66）
 ROS_ULA_PREFIX=''            # 留空则从 LAN_MAC 推导，形如 fdXX:XXXX:XXXX
+BOOT_DELAY='0'               # 开机自启延迟秒数，0-900；开机时各接口还在初始化
 AUTO_TAKEOVER='0'            # 仅网关模式有效，且会禁用 UFI 自身 IPv6
 USB_REPLUG='1'
 WIFI_DEAUTH='1'

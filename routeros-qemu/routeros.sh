@@ -1,7 +1,7 @@
 #!/system/bin/sh
 set -u
 
-MANAGER_VERSION=2026090702
+MANAGER_VERSION=2026090703
 
 # RouterOS CHR (ARM64) runs under QEMU/KVM, not crosvm: CHR boots through UEFI
 # (BOOTAA64.EFI in its ESP) and crosvm has no pflash/MMIO firmware path.  The
@@ -17,6 +17,15 @@ FIRMWARE=""
 FIRMWARE_VARS="$VM_DIR/uefi-vars.fd"
 FIRMWARE_VARS_TEMPLATE=""
 DISK="$VM_DIR/routeros.img"
+# Absolute path to this script, for the detached children that re-invoke it.
+# "$0" is already absolute when launched from the boot script or the plug-in,
+# but resolve it anyway so a relative invocation does not spawn a child that
+# cannot find itself once nohup has changed nothing but the parent's lifetime.
+case "$0" in
+    /*) MANAGER_SELF="$0" ;;
+    *)  MANAGER_SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" ;;
+esac
+[ -f "$MANAGER_SELF" ] || MANAGER_SELF="$VM_DIR/routeros.sh"
 CONFIG="$VM_DIR/vm.conf"
 FORWARDS="$VM_DIR/port-forwards.tsv"
 PIDFILE="$VM_DIR/qemu.pid"
@@ -153,6 +162,7 @@ load_config() {
     # Gateway mode moves DHCP off Android and onto RouterOS; without a server
     # in the guest, clients would simply get no lease.  Ignored when
     # STANDALONE=1 (Android keeps serving DHCP there).
+    : "${BOOT_DELAY:=0}"
     : "${ROS_ULA_PREFIX:=}"
     : "${ROS_DHCP_ENABLED:=1}"
     : "${ROS_DHCP_POOL_START:=100}"
@@ -192,6 +202,10 @@ load_config() {
         0|1) ;;
         *) die "IPV6_PASSTHROUGH must be 0 or 1" ;;
     esac
+    case "$BOOT_DELAY" in
+        ''|*[!0-9]*) die "BOOT_DELAY 必须是 0-900 之间的整数秒: $BOOT_DELAY" ;;
+    esac
+    [ "$BOOT_DELAY" -le 900 ] || die "BOOT_DELAY 最大 900 秒: $BOOT_DELAY"
     # Empty means "derive it" (see ros_ula_prefix).  A hand-set value has to be
     # three hex groups starting fd/fc -- RouterOS would reject anything else
     # mid-script, and sync only checks the IPv4 address afterwards, so a bad
@@ -3307,10 +3321,31 @@ sync_network_config() {
     die "网络同步失败：${sync_reason:-未收到成功标记（日志：$sync_log）}"
 }
 
+# Entry point for /sdcard/ufi_tools_boot.sh.  Two things differ from a plain
+# "start": it honours BOOT_DELAY, and it never blocks the boot script -- the
+# wait happens in a detached child so the rest of the device's boot tasks are
+# not held up for as long as the user configured.
+#
+# A delay is worth having because at boot time the cellular link, the hotspot
+# and the USB gadget are all still coming up; starting the VM into that races
+# setup_network against interfaces that keep changing underneath it.
+boot_start() {
+    load_config
+    resolve_device_config
+    if [ "$BOOT_DELAY" -gt 0 ]; then
+        nohup sh -c 'sleep "$1"; "$2" start' _ "$BOOT_DELAY" "$MANAGER_SELF" \
+            </dev/null >>"$LOG" 2>&1 &
+        echo "boot: RouterOS VM start scheduled in ${BOOT_DELAY}s"
+        return 0
+    fi
+    start_vm
+}
+
 case "${1:-}" in
     __network_monitor) network_monitor ;;
     __vm_watchdog) vm_watchdog "$2" ;;
     start) start_vm ;;
+    boot) boot_start ;;
     stop) stop_vm ;;
     restart) stop_vm; start_vm ;;
     status) status_vm ;;
@@ -3367,7 +3402,7 @@ case "${1:-}" in
     untakeover) untakeover ;;
     uninstall) uninstall_vm ;;
     *)
-        echo "usage: $0 {start|stop|restart|status|preflight|version" >&2
+        echo "usage: $0 {start|boot|stop|restart|status|preflight|version" >&2
         echo "          |qemu-path|firmware-path|refresh-ipv6|logs [lines]" >&2
         echo "          |console-write BASE64|maint INFILE LOGFILE|sync-network [IP] [MASK]" >&2
         echo "          |forwards|disk-info|disk-resize GIB [expand]|disk-reclaim" >&2

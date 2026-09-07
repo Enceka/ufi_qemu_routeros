@@ -24,7 +24,13 @@
   // paths against it.
   const BACKUP_DIR = '/sdcard/RouterOS_QEMU';
   const BOOT_FILE = '/sdcard/ufi_tools_boot.sh';
-  const BOOT_LINE = `${MANAGER} start`;
+  // "boot" rather than "start": it applies BOOT_DELAY and detaches so the
+  // device's boot script is not held up.  BOOT_LINE_LEGACY is what older
+  // versions wrote -- still recognised as "autostart on", and replaced when
+  // the user toggles, so an existing install is not silently downgraded to
+  // "off" in the UI just because the wording changed.
+  const BOOT_LINE = `${MANAGER} boot`;
+  const BOOT_LINE_LEGACY = `${MANAGER} start`;
   const DEFAULT_PACKAGE_URL = 'https://pan.kanokano.cn/d/UFI-TOOLS-UPDATE/plugins/routeros-qemu-vm-arm64.tar.gz';
   const CURL_PATH = '/data/data/com.minikano.f50_sms/files/curl';
   const INSTALL_STAGE = '/data/local/tmp/rosq-plugin-install';
@@ -62,6 +68,7 @@
     ROS_WAN_IFACE: 'wan',
     ROS_LAN_IFACE: 'lan',
     ROS_ULA_PREFIX: '',
+    BOOT_DELAY: '0',
     ROS_DHCP_ENABLED: '1',
     ROS_DHCP_POOL_START: '100',
     ROS_DHCP_POOL_END: '200',
@@ -400,6 +407,10 @@
     for (const key of ['VM_CPUS', 'VM_MEMORY_MIB', 'SSH_DNAT_PORT', 'WEB_DNAT_PORT', 'WINBOX_DNAT_PORT', 'TTYD_PORT']) {
       if (!/^\d+$/.test(String(config[key]))) throw new Error(`${key} 必须是整数`);
     }
+    if (!/^\d+$/.test(String(config.BOOT_DELAY))) throw new Error('开机自启延迟必须是整数秒');
+    // Matches the backend's own cap; catching it here means the user sees why
+    // instead of a save that appears to work and then fails on the device.
+    if (Number(config.BOOT_DELAY) > 900) throw new Error('开机自启延迟最大 900 秒');
     if (Number(config.VM_CPUS) < 1) throw new Error('VM_CPUS 至少为 1');
     if (Number(config.VM_MEMORY_MIB) < 128) throw new Error('RouterOS 至少需要 128 MiB 内存');
     if (!['0', '1'].includes(String(config.STANDALONE))) throw new Error('STANDALONE 只能是 0 或 1');
@@ -475,7 +486,7 @@ if [ -x ${shellQuote(MANAGER)} ]; then
 else
   echo __INSTALLED__=0
 fi
-grep -Fq ${shellQuote(BOOT_LINE)} ${shellQuote(BOOT_FILE)} 2>/dev/null && echo __BOOT__=1 || echo __BOOT__=0
+if grep -Fq ${shellQuote(BOOT_LINE)} ${shellQuote(BOOT_FILE)} 2>/dev/null; then echo __BOOT__=1; elif grep -Fq ${shellQuote(BOOT_LINE_LEGACY)} ${shellQuote(BOOT_FILE)} 2>/dev/null; then echo __BOOT__=1; else echo __BOOT__=0; fi
 echo "__CPUS__=$(ls -d /sys/devices/system/cpu/cpu[0-9]* 2>/dev/null | sed 's#.*/cpu##' | tr '\\n' ',')"
 echo "__MEM__=$(awk '/MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo)"
 `, 40000);
@@ -1057,12 +1068,21 @@ exit "$RC"
   };
 
   // ---- boot autostart ----
+  // Both spellings are stripped before (re)writing, so toggling an install
+  // that still carries the legacy line upgrades it instead of ending up with
+  // two entries that would each start the VM.
+  const dropBootLines = `grep -Fv ${shellQuote(BOOT_LINE)} ${shellQuote(BOOT_FILE)} | grep -Fv ${shellQuote(BOOT_LINE_LEGACY)} > ${shellQuote(`${BOOT_FILE}.tmp`)} && mv ${shellQuote(`${BOOT_FILE}.tmp`)} ${shellQuote(BOOT_FILE)}`;
   const toggleBoot = async () => {
     const enable = !state.bootEnabled;
     const r = await runRoot(enable
-      ? `touch ${shellQuote(BOOT_FILE)}; grep -Fq ${shellQuote(BOOT_LINE)} ${shellQuote(BOOT_FILE)} || printf '%s\\n' ${shellQuote(BOOT_LINE)} >> ${shellQuote(BOOT_FILE)}; echo ok`
-      : `[ -f ${shellQuote(BOOT_FILE)} ] && grep -Fv ${shellQuote(BOOT_LINE)} ${shellQuote(BOOT_FILE)} > ${shellQuote(`${BOOT_FILE}.tmp`)} && mv ${shellQuote(`${BOOT_FILE}.tmp`)} ${shellQuote(BOOT_FILE)}; echo ok`, 20000);
-    toast(r.ok ? (enable ? '已开启开机自启' : '已关闭开机自启') : '设置失败', r.ok);
+      ? `touch ${shellQuote(BOOT_FILE)}; ${dropBootLines}; printf '%s\\n' ${shellQuote(BOOT_LINE)} >> ${shellQuote(BOOT_FILE)}; echo ok`
+      : `[ -f ${shellQuote(BOOT_FILE)} ] && { ${dropBootLines}; }; echo ok`, 20000);
+    const delay = Number(state.config.BOOT_DELAY || 0);
+    toast(r.ok
+      ? (enable
+        ? (delay > 0 ? `已开启开机自启（开机后延迟 ${delay} 秒启动）` : '已开启开机自启')
+        : '已关闭开机自启')
+      : '设置失败', r.ok);
     await refresh();
   };
 
@@ -1432,6 +1452,11 @@ CPU 绑核
               <button id="rosq_takeover">接管 UFI 流量</button>
               <button id="rosq_help">使用帮助</button>
             </div>
+            <div class="rosq-form" style="margin-top:8px">
+              ${field('开机自启延迟（秒，0 = 不等待）', 'BOOT_DELAY', 'number')}
+            </div>
+            <div class="rosq-dim" style="margin-top:6px">开机时蜂窝、热点、USB 都还在初始化，
+              立刻启动会让建网桥的过程和不断变化的接口打架。设 20–60 秒通常够；改完记得「保存设置」。</div>
           </div>
 
           <div class="rosq-card">
