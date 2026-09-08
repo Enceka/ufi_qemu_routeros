@@ -8,6 +8,8 @@
 
 ROOT_DEVICE='/dev/vda'
 DISK_SIZE='1G'
+DATA_DISK_ENABLED='0'        # 挂一块数据盘给 RouterOS 容器（App）用
+DATA_DISK_SIZE_GIB='4'       # 1-64，稀疏文件，标称容量不会立刻占用存储
 
 # ---- 虚拟机资源 ----
 VM_CPUS='4'

@@ -883,3 +883,51 @@ RouterOS      接口实际叫 lan / wan
 
 顺带一提，测这个时踩了个测量陷阱：串口/SSH 会**回显整条命令**，直接 grep
 `__NETWORK_SYNC_OK__` 会匹配到回显里的字面量而不是执行结果，一度让我误判修复无效。
+
+## 数据盘（容器 / App 用）
+
+RouterOS 的容器不能跑在系统分区上，需要一块 `/disk` 下的盘，而 CHR 只有一块盘。
+新增第二块 virtio 盘，**在设备本地生成，不需要上传**：
+
+```
+DATA_DISK="$VM_DIR/data.img"
+DATA_DISK_ENABLED   0/1，默认 0
+DATA_DISK_SIZE_GIB  1-64，默认 4
+```
+
+启动时若启用则 `ensure_data_disk` 先按需创建/扩容（`truncate` 稀疏文件），再追加：
+
+```
+-drive file=$DATA_DISK,if=none,id=datadisk,format=raw,cache=writeback,aio=threads,discard=unmap
+-device virtio-blk-pci,drive=datadisk,disable-legacy=on,disable-modern=off
+```
+
+**故意不给 `bootindex`** —— 否则它可能在启动顺序上压过 CHR 镜像。
+
+子命令：`data-disk-info` / `data-disk-resize GIB` / `data-disk-delete`。
+和系统盘一样**只增不减**（收缩会截断文件系统数据），改动前要求虚拟机停止；
+前端的两个按钮沿用 stop → 操作 → 恢复原运行状态的模式。
+
+空间检查只**警告不阻止**：文件是稀疏的，创建本身不会因空间不足失败，为一个预测
+拒绝启动比让用户自己承担超售更糟。判断依据是本次新增的差值，不是标称总量。
+
+### 实测
+
+* 校验：`0` / `65` / `abc` 均被拒，`4` 通过
+* 稀疏：`truncate -s 2G` 后 `stat -c%b` × 512 = **0 字节实占**
+* qemu 参数：用一次性实例（`-S` 冻结 CPU）跑通，退出码 124 = 被 timeout 杀掉，
+  即参数有效、设备初始化成功
+* **QMP 热插拔不可行**：`device_add virtio-blk-pci` 报
+  `Bus 'pcie.0' does not support hotplugging` —— `virt` 机型要有 pcie-root-port
+  才支持。所以挂载/卸载数据盘必须重启虚拟机，界面上已写明。
+
+### 客户机侧还需要什么
+
+盘挂上之后 RouterOS 里格式化一次：
+
+```
+/disk format-drive [find] file-system=ext4 label=data
+```
+
+另外容器功能本身要 MikroTik 的 `container` 扩展包（.npk），本插件不含 ——
+实测这台 CHR 只装了 `routeros` + `option` 两个包。

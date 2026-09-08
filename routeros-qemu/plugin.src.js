@@ -16,6 +16,7 @@
   const CONFIG = `${VM_DIR}/vm.conf`;
   const FORWARDS = `${VM_DIR}/port-forwards.tsv`;
   const DISK = `${VM_DIR}/routeros.img`;
+  const DATA_DISK = `${VM_DIR}/data.img`;
   const TTYD = `${VM_DIR}/ttyd`;
   const TTYD_SOURCES = ['/data/data/com.minikano.f50_sms/ttyd', '/data/data/com.minikano.f50_sms/files/ttyd'];
   const UPLOAD_DIR = '/data/data/com.minikano.f50_sms/files/uploads';
@@ -69,6 +70,8 @@
     ROS_LAN_IFACE: 'lan',
     ROS_ULA_PREFIX: '',
     BOOT_DELAY: '0',
+    DATA_DISK_ENABLED: '0',
+    DATA_DISK_SIZE_GIB: '4',
     ROS_DHCP_ENABLED: '1',
     ROS_DHCP_POOL_START: '100',
     ROS_DHCP_POOL_END: '200',
@@ -94,6 +97,8 @@
 
   const state = {
     installed: false,
+    dataDiskBytes: 0,
+    dataDiskAllocated: 0,
     running: false,
     bootEnabled: false,
     busy: false,
@@ -483,6 +488,8 @@ if [ -x ${shellQuote(MANAGER)} ]; then
   echo __FWD_END__
   echo "__DISK__=$(stat -c%s ${shellQuote(DISK)} 2>/dev/null || echo 0)"
   echo "__DISKALLOC__=$(( $(stat -c%b ${shellQuote(DISK)} 2>/dev/null || echo 0) * 512 ))"
+  echo "__DATADISK__=$(stat -c%s ${shellQuote(DATA_DISK)} 2>/dev/null || echo 0)"
+  echo "__DATADISKALLOC__=$(( $(stat -c%b ${shellQuote(DATA_DISK)} 2>/dev/null || echo 0) * 512 ))"
 else
   echo __INSTALLED__=0
 fi
@@ -500,6 +507,8 @@ echo "__MEM__=$(awk '/MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo)"
       .split(',').filter(Boolean).map(Number);
     state.diskBytes = Number(text.match(/__DISK__=(\d+)/)?.[1] || 0);
     state.diskAllocated = Number(text.match(/__DISKALLOC__=(\d+)/)?.[1] || 0);
+    state.dataDiskBytes = Number(text.match(/__DATADISK__=(\d+)/)?.[1] || 0);
+    state.dataDiskAllocated = Number(text.match(/__DATADISKALLOC__=(\d+)/)?.[1] || 0);
 
     const statusLine = text.match(/__STATUS__=([^\n]*)/)?.[1] || '';
     state.running = statusLine.startsWith('running');
@@ -926,6 +935,63 @@ echo __SYNC_STAGE_DONE__
   };
 
   // ---- disk ----
+  // Both data-disk actions need the VM down (qemu holds the image open), so
+  // they reuse the stop/act/restore-previous-state shape the other disk
+  // operations use rather than demanding the user stop it by hand.
+  const dataDiskJob = (args, label) => runRootJob(`
+set -u
+WAS_RUNNING=0
+${shellQuote(MANAGER)} status >/dev/null 2>&1 && WAS_RUNNING=1
+[ "$WAS_RUNNING" = 0 ] || ${shellQuote(MANAGER)} stop >/dev/null 2>&1
+${shellQuote(MANAGER)} ${args} 2>&1
+RC=$?
+[ "$WAS_RUNNING" = 0 ] || ${shellQuote(MANAGER)} start >/dev/null 2>&1
+[ "$RC" = 0 ] && echo __DATADISK_OK__
+exit "$RC"
+`, label, { successMarker: '__DATADISK_OK__', timeout: 600000 });
+
+  const resizeDataDisk = async () => {
+    if (state.busy) return toast('有操作正在进行', false);
+    if (!state.installed) return toast('请先安装资源包', false);
+    const current = Math.ceil(state.dataDiskBytes / 1073741824);
+    const suggested = String(Math.max(Number(state.config.DATA_DISK_SIZE_GIB) || 4, current || 0) || 4);
+    const answer = prompt('数据盘容量（GiB，1-64；只能变大，缩小会截断数据）', suggested);
+    if (!answer) return;
+    if (!/^\d+$/.test(answer)) return toast('请输入整数 GiB', false);
+    setBusy(true, '正在准备数据盘…');
+    try {
+      const r = await dataDiskJob(`data-disk-resize ${shellQuote(answer)}`, 'data-disk-resize');
+      if (!r.ok) throw new Error(r.text.split('\n').filter(Boolean).slice(-2).join(' '));
+      // Keep the stored size in step, otherwise the next start would size the
+      // image back down to whatever the form still says.
+      state.config.DATA_DISK_SIZE_GIB = answer;
+      const keyEl = q('[data-key="DATA_DISK_SIZE_GIB"]');
+      if (keyEl) keyEl.value = answer;
+      await writeConfig(state.config);
+      toast(`数据盘已就绪：${answer} GiB。勾选「挂载数据盘」并重启虚拟机后，在 RouterOS 里格式化即可。`, true, 9000);
+    } finally {
+      setBusy(false);
+      await refresh();
+    }
+  };
+
+  const deleteDataDisk = async () => {
+    if (state.busy) return toast('有操作正在进行', false);
+    if (!state.dataDiskBytes) return toast('数据盘不存在', false);
+    if (!await confirmAsk('rosq_del_datadisk', '删除数据盘',
+      `将删除 ${formatBytes(state.dataDiskBytes)} 的数据盘镜像，`
+      + '<strong style="color:#ff7777">里面的容器和数据全部丢失且无法恢复</strong>。'
+      + '<br>备份镜像只含系统盘，不包含这块盘。', '删除', 6)) return;
+    setBusy(true, '正在删除数据盘…');
+    try {
+      const r = await dataDiskJob('data-disk-delete', 'data-disk-delete');
+      toast(r.ok ? '数据盘已删除' : `删除失败：${r.text.split('\n').filter(Boolean).slice(-2).join(' ')}`, r.ok);
+    } finally {
+      setBusy(false);
+      await refresh();
+    }
+  };
+
   const expandDisk = async () => {
     const answer = prompt('扩容到多少 GiB？（只能变大，RouterOS 启动后自动扩展分区）',
       String(Math.max(2, Math.ceil(state.diskBytes / 1073741824) + 1)));
@@ -1193,7 +1259,7 @@ echo __UNINSTALL_OK__
     for (const id of ['rosq_restart', 'rosq_preflight', 'rosq_logs', 'rosq_save', 'rosq_save_restart',
       'rosq_expand_disk', 'rosq_reclaim_disk', 'rosq_backup', 'rosq_restore', 'rosq_uninstall',
       'rosq_ttyd_open', 'rosq_ttyd_restart', 'rosq_ttyd_stop', 'rosq_boot', 'rosq_usb_refresh',
-      'rosq_sync']) {
+      'rosq_sync', 'rosq_datadisk_resize', 'rosq_datadisk_delete']) {
       const el = q(`#${id}`);
       if (el) el.disabled = state.busy || !state.installed;
     }
@@ -1217,6 +1283,18 @@ echo __UNINSTALL_OK__
     el.textContent = state.diskBytes
       ? `镜像 ${formatBytes(state.diskBytes)}，实际占用 ${formatBytes(state.diskAllocated)}`
       : '尚未导入 CHR 镜像 —— 请在「安装与资源包」里点「导入 CHR 镜像…」';
+
+    const dd = q('#rosq_datadisk_summary');
+    if (!dd) return;
+    const on = String(state.config.DATA_DISK_ENABLED) === '1';
+    if (!state.dataDiskBytes) {
+      dd.textContent = on
+        ? '已勾选但尚未创建 —— 点「创建 / 扩容数据盘」，或启动虚拟机时自动创建。'
+        : '未启用。勾选后创建，虚拟机重启才会挂载。';
+      return;
+    }
+    dd.textContent = `镜像 ${formatBytes(state.dataDiskBytes)}，实际占用 ${formatBytes(state.dataDiskAllocated)}`
+      + (on ? '（已挂载给客户机）' : '（存在但未挂载 —— 勾选并重启虚拟机后生效）');
   };
 
   const renderForwards = () => {
@@ -1587,6 +1665,22 @@ CPU 绑核
               <button id="rosq_backup">备份镜像</button>
               <button id="rosq_restore">备份管理 / 恢复</button>
             </div>
+
+            <div class="rosq-head" style="margin-top:12px"><span class="rosq-title">数据盘（容器 / App 用）</span></div>
+            <div id="rosq_datadisk_summary" class="rosq-dim">—</div>
+            <div class="rosq-form" style="margin-top:6px">
+              ${check('挂载数据盘（改动后需重启虚拟机）', 'DATA_DISK_ENABLED')}
+              ${field('数据盘容量（GiB，1-64）', 'DATA_DISK_SIZE_GIB', 'number')}
+            </div>
+            <div class="rosq-actions" style="margin-top:6px">
+              <button id="rosq_datadisk_resize">创建 / 扩容数据盘</button>
+              <button id="rosq_datadisk_delete">删除数据盘</button>
+            </div>
+            <div class="rosq-dim" style="margin-top:6px">RouterOS 的容器（App）不能跑在系统分区上，需要一块
+              <code>/disk</code> 下的盘。这里在设备本地生成一个稀疏镜像挂给客户机，<b>不需要上传</b>，
+              标称容量不会立刻占用存储。挂上之后在 RouterOS 里格式化一次：
+              <code>/disk format-drive [find] file-system=ext4 label=data</code>。
+              <br>另外还需要 MikroTik 的 <code>container</code> 扩展包（.npk），本插件不含。</div>
           </div>
 
           <div class="rosq-card">
@@ -1652,6 +1746,8 @@ CPU 绑核
     el.querySelector('#rosq_usb_refresh').onclick = guard(refreshUsb, '刷新 USB');
     el.querySelector('#rosq_expand_disk').onclick = guard(expandDisk, '扩容磁盘');
     el.querySelector('#rosq_reclaim_disk').onclick = guard(reclaimDisk, '回收空间');
+    el.querySelector('#rosq_datadisk_resize').onclick = guard(resizeDataDisk, '数据盘');
+    el.querySelector('#rosq_datadisk_delete').onclick = guard(deleteDataDisk, '删除数据盘');
     el.querySelector('#rosq_backup').onclick = guard(createBackup, '备份');
     el.querySelector('#rosq_restore').onclick = guard(openBackupManager, '备份管理');
     el.querySelector('#rosq_ttyd_open').onclick = guard(openTtyd, '打开终端');

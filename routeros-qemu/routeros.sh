@@ -1,7 +1,7 @@
 #!/system/bin/sh
 set -u
 
-MANAGER_VERSION=2026090801
+MANAGER_VERSION=2026090802
 
 # RouterOS CHR (ARM64) runs under QEMU/KVM, not crosvm: CHR boots through UEFI
 # (BOOTAA64.EFI in its ESP) and crosvm has no pflash/MMIO firmware path.  The
@@ -17,6 +17,10 @@ FIRMWARE=""
 FIRMWARE_VARS="$VM_DIR/uefi-vars.fd"
 FIRMWARE_VARS_TEMPLATE=""
 DISK="$VM_DIR/routeros.img"
+# Second virtio disk, created on the device rather than uploaded.  RouterOS
+# containers ("apps") refuse to run off the system partition -- they need a
+# formatted disk under /disk -- and CHR ships with only the one drive.
+DATA_DISK="$VM_DIR/data.img"
 # Absolute path to this script, for the detached children that re-invoke it.
 # "$0" is already absolute when launched from the boot script or the plug-in,
 # but resolve it anyway so a relative invocation does not spawn a child that
@@ -162,6 +166,8 @@ load_config() {
     # Gateway mode moves DHCP off Android and onto RouterOS; without a server
     # in the guest, clients would simply get no lease.  Ignored when
     # STANDALONE=1 (Android keeps serving DHCP there).
+    : "${DATA_DISK_ENABLED:=0}"
+    : "${DATA_DISK_SIZE_GIB:=4}"
     : "${BOOT_DELAY:=0}"
     : "${ROS_ULA_PREFIX:=}"
     : "${ROS_DHCP_ENABLED:=1}"
@@ -202,6 +208,15 @@ load_config() {
         0|1) ;;
         *) die "IPV6_PASSTHROUGH must be 0 or 1" ;;
     esac
+    case "$DATA_DISK_ENABLED" in
+        0|1) ;;
+        *) die "DATA_DISK_ENABLED must be 0 or 1" ;;
+    esac
+    case "$DATA_DISK_SIZE_GIB" in
+        ''|*[!0-9]*) die "DATA_DISK_SIZE_GIB 必须是整数 GiB: $DATA_DISK_SIZE_GIB" ;;
+    esac
+    { [ "$DATA_DISK_SIZE_GIB" -ge 1 ] && [ "$DATA_DISK_SIZE_GIB" -le 64 ]; } || \
+        die "DATA_DISK_SIZE_GIB 必须在 1-64 之间: $DATA_DISK_SIZE_GIB"
     case "$BOOT_DELAY" in
         ''|*[!0-9]*) die "BOOT_DELAY 必须是 0-900 之间的整数秒: $BOOT_DELAY" ;;
     esac
@@ -2238,6 +2253,11 @@ start_vm() {
     # An xhci controller has to exist up front or USB hotplug has no bus to
     # attach to; RouterOS itself needs no input devices.
     [ "$USB_BUS_ENABLED" = 1 ] && extra_device_args="$extra_device_args -device qemu-xhci,id=usb-bus"
+    # No bootindex: this disk must never win the boot order over the CHR image.
+    if [ "$DATA_DISK_ENABLED" = 1 ]; then
+        ensure_data_disk
+        extra_device_args="$extra_device_args -drive file=$DATA_DISK,if=none,id=datadisk,format=raw,cache=writeback,aio=threads,discard=unmap -device virtio-blk-pci,drive=datadisk,disable-legacy=on,disable-modern=off"
+    fi
 
     accel_args="-accel $ACCEL"
     [ "$ACCEL" = tcg ] && accel_args="-accel tcg,thread=multi"
@@ -2810,6 +2830,70 @@ disk_allocated_bytes() {
         ''|*[!0-9]*) disk_bytes ;;
         *) echo $((disk_blocks * 512)) ;;
     esac
+}
+
+# Create the data disk on first use, and grow it if the configured size went
+# up.  Sparse, so a 4 GiB disk costs nothing until the guest writes to it --
+# but that also means Android storage can run out later, which is why the
+# free-space check looks at the *delta* being added, not the nominal size.
+ensure_data_disk() {
+    data_target=$((DATA_DISK_SIZE_GIB * 1024 * 1024 * 1024))
+    data_current=0
+    [ -f "$DATA_DISK" ] && data_current="$(stat -c%s "$DATA_DISK" 2>/dev/null || echo 0)"
+    [ "$data_target" -gt "$data_current" ] || return 0
+    data_free_kib="$(df -k "$VM_DIR" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+    case "$data_free_kib" in
+        ''|*[!0-9]*) data_free_kib=0 ;;
+    esac
+    # Only warn: the file is sparse, so creating it cannot itself fail for
+    # space, and refusing to start over a projection would be worse than
+    # letting the user run a thin-provisioned disk deliberately.
+    if [ "$data_free_kib" -gt 0 ] && \
+            [ "$data_free_kib" -lt $(((data_target - data_current) / 1024)) ]; then
+        echo "warning: 数据盘标称 ${DATA_DISK_SIZE_GIB}GiB，超过剩余空间 $((data_free_kib / 1024))MiB；文件是稀疏的，写满会失败" >&2
+    fi
+    truncate -s "$data_target" "$DATA_DISK" || die "无法创建/扩容数据盘 $DATA_DISK"
+    chmod 600 "$DATA_DISK" 2>/dev/null || true
+}
+
+show_data_disk_info() {
+    load_config
+    echo "DATA_DISK_PATH=$DATA_DISK"
+    echo "DATA_DISK_ENABLED=$DATA_DISK_ENABLED"
+    if [ -f "$DATA_DISK" ]; then
+        echo "DATA_DISK_BYTES=$(stat -c%s "$DATA_DISK" 2>/dev/null || echo 0)"
+        echo "DATA_DISK_ALLOCATED=$(( $(stat -c%b "$DATA_DISK" 2>/dev/null || echo 0) * 512 ))"
+    else
+        echo "DATA_DISK_BYTES=0"
+        echo "DATA_DISK_ALLOCATED=0"
+    fi
+}
+
+# Grow only, same reasoning as the system disk: shrinking a raw image cuts
+# live filesystem data off the end.
+resize_data_disk() {
+    load_config
+    data_gib="${1:-}"
+    case "$data_gib" in ''|*[!0-9]*) die "data-disk-resize 需要 GiB 整数" ;; esac
+    { [ "$data_gib" -ge 1 ] && [ "$data_gib" -le 64 ]; } || die "数据盘容量必须在 1-64 GiB 之间"
+    is_running && die "请先停止虚拟机再调整数据盘"
+    data_target=$((data_gib * 1024 * 1024 * 1024))
+    if [ -f "$DATA_DISK" ]; then
+        data_current="$(stat -c%s "$DATA_DISK" 2>/dev/null || echo 0)"
+        [ "$data_target" -gt "$data_current" ] || \
+            die "目标容量 ${data_gib}GiB 不大于当前容量（$data_current 字节）；收缩会截断数据"
+    fi
+    DATA_DISK_SIZE_GIB="$data_gib"
+    ensure_data_disk
+    echo "数据盘已就绪：${data_gib} GiB（$DATA_DISK）"
+}
+
+delete_data_disk() {
+    load_config
+    is_running && die "请先停止虚拟机再删除数据盘"
+    [ -f "$DATA_DISK" ] || { echo "数据盘不存在，无需删除"; return 0; }
+    rm -f "$DATA_DISK" || die "删除失败"
+    echo "数据盘已删除：$DATA_DISK"
 }
 
 show_disk_info() {
@@ -3387,6 +3471,9 @@ case "${1:-}" in
     disk-info) show_disk_info ;;
     disk-resize) resize_disk "${2:-}" "${3:-expand}" ;;
     disk-reclaim) reclaim_disk ;;
+    data-disk-info) show_data_disk_info ;;
+    data-disk-resize) resize_data_disk "${2:-}" ;;
+    data-disk-delete) delete_data_disk ;;
     backup) backup_vm "${2:-}" ;;
     backups) list_backups ;;
     restore-backup) restore_backup "${2:-}" ;;
@@ -3423,6 +3510,7 @@ case "${1:-}" in
         echo "          |console-write BASE64|maint INFILE LOGFILE|sync-network [IP] [MASK]" >&2
         echo "          |forwards|disk-info|disk-resize GIB [expand]|disk-reclaim" >&2
         echo "          |backup NAME|backups|restore-backup DIR|delete-backup DIR" >&2
+        echo "          |data-disk-info|data-disk-resize GIB|data-disk-delete" >&2
         echo "          |ttyd-restart|ttyd-stop" >&2
         echo "          |usb {list|attach NAME|detach PORT|auto {add VID:PID|del VID:PID}}" >&2
         echo "          |takeover|untakeover|uninstall}" >&2
