@@ -829,3 +829,57 @@ RouterOS 作为默认 v6 路由器直到 `ra-lifetime` 到期（30 分钟）。
 /ip dhcp-server add name=rosq-lan-dhcp interface=lan …
 :if ([:len [/ip firewall nat find where … out-interface="wan" …]] = 0) do={ … }
 ```
+
+## 同步会半途失败却报成功
+
+用户报告"把 DHCP 池改成 10-100 后拿不到地址、连不上热点"。查下来**地址池是无辜的**：
+RouterOS 接受 `192.168.42.10-192.168.42.100`（实测建出 91 个可用地址），
+`dhcp_pool_ranges()` 生成的字符串也正确。改池子只是**触发了一次同步**而已。
+
+真正的原因是接口名不一致。当时设备上：
+
+```
+routeros.sh   MANAGER_VERSION=2026090616   （改名之前的版本）
+vm.conf       ROS_LAN_IFACE='ether2'
+RouterOS      接口实际叫 lan / wan
+```
+
+于是下发的脚本里每一条指名接口的命令都失败：
+
+```
+/ip address remove [find where interface=ether2]      → 匹配不到，静默无操作
+/ip address add    ... interface=ether2               → input does not match any value of interface
+/ip dhcp-server add ... interface=ether2              → 同样失败
+```
+
+`remove` 因为同样匹配不到而变成空操作，所以**旧地址原封不动地留着**；而按名字删除的
+`dhcp-server remove [find where name="rosq-lan-dhcp"]` 和 `pool remove` 都成功了。
+净效果：**DHCP 服务器被删掉、没能重建**，客户端从此拿不到地址。
+
+而当时的成功判定是：
+
+```
+:if ([:len [/ip address find where address="192.168.42.253/24"]] > 0) do={ :put "__NETWORK_SYNC_OK__" }
+```
+
+只问"这个地址存不存在"—— 旧地址还在，于是**报成功**。用户看到"已保存并同步"，网络却废了。
+
+修法：判定改成检查同步真正需要**建立**的东西，而不只是"存在某个匹配的地址"：
+
+```
+:if ([:len [/ip address find where address="…" && interface="lan"]] > 0) do={
+    :if ([:len [/ip dhcp-server find where name="rosq-lan-dhcp" && interface="lan"]] > 0) do={
+        :put "__NETWORK_SYNC_OK__"
+    } else={ :put "__NETWORK_SYNC_ERROR__=DHCP 服务器未建立在 lan 上（接口名可能对不上）" }
+} else={ :put "__NETWORK_SYNC_ERROR__=LAN 地址 … 未应用到 lan（接口名可能对不上）" }
+```
+
+地址钉到接口上，并在网关模式且启用 DHCP 时要求服务器确实存在。独立模式下不查 DHCP
+（那时本来就该没有）。三个分支都在真机上验证过：正确接口 → OK；错成 `ether2` → 报
+地址错误；查一个不存在的服务器名 → 报 DHCP 错误。
+
+根因本身在新版里已经自愈 —— 改名两行按只读的 `default-name` 把接口名强制对齐到
+`vm.conf`，所以两边不会再漂移。这个加强判定是兜底，用来捕获其它半途失败。
+
+顺带一提，测这个时踩了个测量陷阱：串口/SSH 会**回显整条命令**，直接 grep
+`__NETWORK_SYNC_OK__` 会匹配到回显里的字面量而不是执行结果，一度让我误判修复无效。

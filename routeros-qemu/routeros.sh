@@ -1,7 +1,7 @@
 #!/system/bin/sh
 set -u
 
-MANAGER_VERSION=2026090703
+MANAGER_VERSION=2026090801
 
 # RouterOS CHR (ARM64) runs under QEMU/KVM, not crosvm: CHR boots through UEFI
 # (BOOTAA64.EFI in its ESP) and crosvm has no pflash/MMIO firmware path.  The
@@ -3306,7 +3306,23 @@ sync_network_config() {
                 sync_ipv6_managed_cli
             fi
         fi
-        printf ':if ([:len [/ip address find where address="%s"]] > 0) do={ :put "__NETWORK_SYNC_OK__" } else={ :put "__NETWORK_SYNC_ERROR__=address not applied" }\n' "$sync_addr"
+        # Verify what the sync had to *create*, not merely that some matching
+        # address exists.  A stale ROS_LAN_IFACE (an install whose vm.conf still
+        # said ether2 while the NIC had been renamed) makes every line that
+        # names the interface fail with "input does not match any value of
+        # interface" -- but the paired "remove" lines miss for the same reason,
+        # so the old address survives and the weaker check reported success
+        # while the DHCP server was gone and clients could no longer get a
+        # lease.  Pin the address to its interface, and require the DHCP server
+        # whenever one was supposed to be installed.
+        if [ "${STANDALONE:-0}" != 1 ] && [ "$ROS_DHCP_ENABLED" = 1 ]; then
+            sync_dhcp_check="$(printf ':if ([:len [/ip dhcp-server find where name="%s" && interface="%s"]] > 0) do={ :put "__NETWORK_SYNC_OK__" } else={ :put "__NETWORK_SYNC_ERROR__=DHCP 服务器未建立在 %s 上（接口名可能对不上）" }' \
+                "$sync_dhcp_name" "$ROS_LAN_IFACE" "$ROS_LAN_IFACE")"
+        else
+            sync_dhcp_check=':put "__NETWORK_SYNC_OK__"'
+        fi
+        printf ':if ([:len [/ip address find where address="%s" && interface="%s"]] > 0) do={ %s } else={ :put "__NETWORK_SYNC_ERROR__=LAN 地址 %s 未应用到 %s（接口名可能对不上）" }\n' \
+            "$sync_addr" "$ROS_LAN_IFACE" "$sync_dhcp_check" "$sync_addr" "$ROS_LAN_IFACE"
         printf '/system shutdown\n'
         # /system shutdown is interactive: answer its [y/N] prompt.
         printf 'y\n'
