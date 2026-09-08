@@ -931,3 +931,66 @@ DATA_DISK_SIZE_GIB  1-64，默认 4
 
 另外容器功能本身要 MikroTik 的 `container` 扩展包（.npk），本插件不含 ——
 实测这台 CHR 只装了 `routeros` + `option` 两个包。
+
+## 设备 shell 是 32 位算术，尺寸 ≥2GiB 全部算错
+
+数据盘死活建不出来，qemu 报 `Could not open '…/data.img'`，而 `data-disk-resize`
+却打印"数据盘已就绪"。根因跟磁盘无关 —— 是设备 shell 的整数宽度：
+
+```
+$((2 * 1024 * 1024 * 1024))  = -2147483648
+$((4 * 1024 * 1024 * 1024))  = 0
+$((1 * 1024 * 1024 * 1024))  = 1073741824   ← 只有 <2GiB 正确
+```
+
+**`test` 也一样**，而且错得更隐蔽（两边都截断时有时还能歪打正着）：
+
+```
+[ 2147483648  -gt 0 ]          -> false   ← 错
+[ 4294967296  -gt 2147483648 ] -> true    ← 巧合
+[ 68719476736 -gt 4294967296 ] -> false   ← 错
+```
+
+于是 `ensure_data_disk` 把目标算成负数，判定"当前已经够大"，直接 return，
+一个字节都没写；`resize_data_disk` 照样打印成功；`start_vm` 又把 `-drive`
+拼了上去 —— qemu 拒绝启动，虚拟机再也起不来。
+
+同样的写法在 `resize_disk`（系统盘扩容）里也有，属于早就存在但没人踩到的 bug：
+扩到 ≥2GiB 会报"目标容量不大于当前容量"。`disk_allocated_bytes` 的
+`$((blocks * 512))` 和插件里的 `__DISKALLOC__` 同理。
+
+修法是所有字节级运算与比较一律走 awk（双精度，实测到 64GiB 精确）：
+
+```sh
+num_mul() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.0f", a * b }'; }
+num_sub() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.0f", a - b }'; }
+num_gt()  { [ "$(awk -v a="$1" -v b="$2" 'BEGIN { print (a > b) ? 1 : 0 }')" = 1 ]; }
+```
+
+共 9 处（脚本）+ 2 处（插件内嵌的探测脚本）。实测 1/2/4 GiB 都能正确建出，
+收缩守卫也正常触发。
+
+设备实测数据盘端到端：RouterOS 自动识别、格式化并挂载，`/disk print` 显示
+`BM disk … 2 147 483 648`，还自建了 384MB 交换文件。容器存储位置 `/disk` 可用。
+
+## ttyd 只认 pidfile，遗留进程会占死端口
+
+qemu 启动失败那次，ttyd 已经先起来了，但随后的清理把 pidfile 删了、没杀进程。
+下次启动便报：
+
+```
+lws_socket_bind: ERROR on binding fd 12 to port 7682 (-1 98)
+```
+
+98 = EADDRINUSE。`stop_ttyd` 只按 pidfile 杀，找不到就放弃，于是串口终端从此静默失效。
+
+改成 pidfile 之外再扫一遍 `/proc/*/cmdline`，凡是命令行里同时含 `ttyd` 和**本插件的
+serial.sock 路径**的一律杀掉 —— 路径把范围钉死在自己的进程上，厂商那个跑在 1146
+端口、跑的是 `login.sh` 的 ttyd 不受影响。
+
+一个小陷阱：进程会在 glob 和读取之间消失，而**失败的重定向是 shell 自己报错**，
+`2>/dev/null` 挂在 `tr` 上抓不到，必须放进子 shell：
+
+```sh
+ttyd_cmd="$( (tr '\000' ' ' < "$ttyd_proc/cmdline") 2>/dev/null )"
+```

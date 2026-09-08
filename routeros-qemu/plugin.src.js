@@ -487,9 +487,9 @@ if [ -x ${shellQuote(MANAGER)} ]; then
   cat ${shellQuote(FORWARDS)} 2>/dev/null
   echo __FWD_END__
   echo "__DISK__=$(stat -c%s ${shellQuote(DISK)} 2>/dev/null || echo 0)"
-  echo "__DISKALLOC__=$(( $(stat -c%b ${shellQuote(DISK)} 2>/dev/null || echo 0) * 512 ))"
+  echo "__DISKALLOC__=$(awk -v b="$(stat -c%b ${shellQuote(DISK)} 2>/dev/null || echo 0)" 'BEGIN{printf "%.0f", b * 512}')"
   echo "__DATADISK__=$(stat -c%s ${shellQuote(DATA_DISK)} 2>/dev/null || echo 0)"
-  echo "__DATADISKALLOC__=$(( $(stat -c%b ${shellQuote(DATA_DISK)} 2>/dev/null || echo 0) * 512 ))"
+  echo "__DATADISKALLOC__=$(awk -v b="$(stat -c%b ${shellQuote(DATA_DISK)} 2>/dev/null || echo 0)" 'BEGIN{printf "%.0f", b * 512}')"
 else
   echo __INSTALLED__=0
 fi

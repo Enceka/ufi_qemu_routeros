@@ -1,7 +1,7 @@
 #!/system/bin/sh
 set -u
 
-MANAGER_VERSION=2026090802
+MANAGER_VERSION=2026090805
 
 # RouterOS CHR (ARM64) runs under QEMU/KVM, not crosvm: CHR boots through UEFI
 # (BOOTAA64.EFI in its ESP) and crosvm has no pflash/MMIO firmware path.  The
@@ -2204,6 +2204,23 @@ stop_ttyd() {
         [ -n "$ttyd_pid" ] && kill "$ttyd_pid" 2>/dev/null || true
     fi
     rm -f "$TTYD_PIDFILE"
+    # The pidfile is not enough on its own: a start that died after launching
+    # ttyd (qemu refusing to boot, say) leaves the daemon holding port 7682
+    # with no pidfile to find it by, and the next start then fails with
+    # "lws_socket_bind: ERROR on binding fd to port 7682" -- the console just
+    # silently stops working.  Sweep for any ttyd still attached to our own
+    # serial socket; the path makes it ours and leaves the vendor's ttyd
+    # (a different port and script) alone.
+    for ttyd_proc in /proc/[0-9]*; do
+        # Short-lived processes disappear between the glob and the read, and the
+        # failing redirect is reported by the shell itself -- so it has to be
+        # silenced inside a subshell, not on the command.
+        ttyd_cmd="$( (tr '\000' ' ' < "$ttyd_proc/cmdline") 2>/dev/null )"
+        [ -n "$ttyd_cmd" ] || continue
+        case "$ttyd_cmd" in
+            *ttyd*"$SERIAL_SOCKET"*) kill "${ttyd_proc##*/}" 2>/dev/null || true ;;
+        esac
+    done
 }
 
 start_vm() {
@@ -2820,6 +2837,18 @@ list_forwards() {
 }
 
 # ---- Disk maintenance ----
+# The device's shell truncates BOTH arithmetic and test(1) comparisons to 32
+# bits: $((2 * 1024 * 1024 * 1024)) evaluates to -2147483648, and
+# [ 2147483648 -gt 0 ] is false.  Every byte-sized value at or above 2 GiB was
+# therefore silently wrong -- ensure_data_disk computed a negative target,
+# decided the disk was already big enough, created nothing, and start_vm then
+# handed qemu a -drive pointing at a file that did not exist.  Route all
+# byte-sized maths and comparisons through awk, which uses doubles and stays
+# exact far past any disk size this supports (verified on-device up to 64 GiB).
+num_mul() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.0f", a * b }'; }
+num_sub() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.0f", a - b }'; }
+num_gt() { [ "$(awk -v a="$1" -v b="$2" 'BEGIN { print (a > b) ? 1 : 0 }')" = 1 ]; }
+
 disk_bytes() {
     stat -c%s "$DISK" 2>/dev/null || toybox stat -c%s "$DISK" 2>/dev/null || wc -c < "$DISK"
 }
@@ -2828,7 +2857,7 @@ disk_allocated_bytes() {
     disk_blocks="$(stat -c%b "$DISK" 2>/dev/null || toybox stat -c%b "$DISK" 2>/dev/null)"
     case "$disk_blocks" in
         ''|*[!0-9]*) disk_bytes ;;
-        *) echo $((disk_blocks * 512)) ;;
+        *) num_mul "$disk_blocks" 512 ;;
     esac
 }
 
@@ -2837,10 +2866,10 @@ disk_allocated_bytes() {
 # but that also means Android storage can run out later, which is why the
 # free-space check looks at the *delta* being added, not the nominal size.
 ensure_data_disk() {
-    data_target=$((DATA_DISK_SIZE_GIB * 1024 * 1024 * 1024))
+    data_target="$(num_mul "$DATA_DISK_SIZE_GIB" 1073741824)"
     data_current=0
     [ -f "$DATA_DISK" ] && data_current="$(stat -c%s "$DATA_DISK" 2>/dev/null || echo 0)"
-    [ "$data_target" -gt "$data_current" ] || return 0
+    num_gt "$data_target" "$data_current" || return 0
     data_free_kib="$(df -k "$VM_DIR" 2>/dev/null | awk 'NR == 2 { print $4 }')"
     case "$data_free_kib" in
         ''|*[!0-9]*) data_free_kib=0 ;;
@@ -2848,8 +2877,8 @@ ensure_data_disk() {
     # Only warn: the file is sparse, so creating it cannot itself fail for
     # space, and refusing to start over a projection would be worse than
     # letting the user run a thin-provisioned disk deliberately.
-    if [ "$data_free_kib" -gt 0 ] && \
-            [ "$data_free_kib" -lt $(((data_target - data_current) / 1024)) ]; then
+    data_need_kib="$(awk -v t="$data_target" -v c="$data_current" 'BEGIN { printf "%.0f", (t - c) / 1024 }')"
+    if [ "$data_free_kib" -gt 0 ] && num_gt "$data_need_kib" "$data_free_kib"; then
         echo "warning: 数据盘标称 ${DATA_DISK_SIZE_GIB}GiB，超过剩余空间 $((data_free_kib / 1024))MiB；文件是稀疏的，写满会失败" >&2
     fi
     truncate -s "$data_target" "$DATA_DISK" || die "无法创建/扩容数据盘 $DATA_DISK"
@@ -2862,7 +2891,7 @@ show_data_disk_info() {
     echo "DATA_DISK_ENABLED=$DATA_DISK_ENABLED"
     if [ -f "$DATA_DISK" ]; then
         echo "DATA_DISK_BYTES=$(stat -c%s "$DATA_DISK" 2>/dev/null || echo 0)"
-        echo "DATA_DISK_ALLOCATED=$(( $(stat -c%b "$DATA_DISK" 2>/dev/null || echo 0) * 512 ))"
+        echo "DATA_DISK_ALLOCATED=$(num_mul "$(stat -c%b "$DATA_DISK" 2>/dev/null || echo 0)" 512)"
     else
         echo "DATA_DISK_BYTES=0"
         echo "DATA_DISK_ALLOCATED=0"
@@ -2877,10 +2906,10 @@ resize_data_disk() {
     case "$data_gib" in ''|*[!0-9]*) die "data-disk-resize 需要 GiB 整数" ;; esac
     { [ "$data_gib" -ge 1 ] && [ "$data_gib" -le 64 ]; } || die "数据盘容量必须在 1-64 GiB 之间"
     is_running && die "请先停止虚拟机再调整数据盘"
-    data_target=$((data_gib * 1024 * 1024 * 1024))
+    data_target="$(num_mul "$data_gib" 1073741824)"
     if [ -f "$DATA_DISK" ]; then
         data_current="$(stat -c%s "$DATA_DISK" 2>/dev/null || echo 0)"
-        [ "$data_target" -gt "$data_current" ] || \
+        num_gt "$data_target" "$data_current" || \
             die "目标容量 ${data_gib}GiB 不大于当前容量（$data_current 字节）；收缩会截断数据"
     fi
     DATA_DISK_SIZE_GIB="$data_gib"
@@ -2915,9 +2944,9 @@ resize_disk() {
     [ "$resize_gib" -ge 1 ] || die "磁盘容量至少 1 GiB"
     [ "$resize_mode" = expand ] || die "仅支持 expand（收缩会截断数据）"
     is_running && die "请先停止虚拟机再调整磁盘"
-    resize_target=$((resize_gib * 1024 * 1024 * 1024))
+    resize_target="$(num_mul "$resize_gib" 1073741824)"
     resize_current="$(disk_bytes)"
-    [ "$resize_target" -gt "$resize_current" ] || \
+    num_gt "$resize_target" "$resize_current" || \
         die "目标容量 ${resize_gib}GiB 不大于当前容量（$resize_current 字节）"
     truncate -s "$resize_target" "$DISK" || die "扩容失败"
     echo "磁盘已扩容到 ${resize_gib} GiB，RouterOS 启动后会自动扩展分区"
